@@ -1,4 +1,8 @@
 #include "disc_service.hpp"
+
+#ifdef YMIR_RECOMP_NATIVE
+    #include <app/ship/ship.hpp>
+#endif
 #include "rom_service.hpp"
 
 #include <app/events/emu_event_factory.hpp>
@@ -64,6 +68,13 @@ void DiscService::ProcessOpenDiscImageFileDialogSelection(const char *const *fil
 
 bool DiscService::LoadDiscImage(std::filesystem::path path, bool showErrorModal) {
     auto &settings = m_settings;
+
+#ifdef YMIR_RECOMP_NATIVE
+    // Drydock ship: only the game's own disc, once the game is built
+    if (!ship::BeforeLoadDisc(path)) {
+        return false;
+    }
+#endif
 
     // Try to load disc image from specified path
     devlog::info<grp::base>("Loading disc image from {}", path);

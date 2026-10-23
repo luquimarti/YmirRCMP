@@ -84,6 +84,7 @@
 #include <ymir/sys/saturn.hpp>
 
 #ifdef YMIR_RECOMP_NATIVE
+    #include <app/ship/ship.hpp>
     #include <ymir_recomp/runtime.hpp>
 #endif
 
@@ -351,7 +352,15 @@ int App::Run(const CommandLineOptions &options) {
     // 5. user profile, if it contains the settings file
     // 6. show dialog to choose "installed" or "portable" mode
     // NOTE: Under Flatpak, portable profile isn't allowed; installed profile is forced
-    if (!options.profilePath.empty()) {
+#ifdef YMIR_RECOMP_NATIVE
+    // Drydock ship: always portable, next to the executable
+    const bool isShip = ship::Init(m_context, Profile::GetExecutableProfilePath());
+#else
+    const bool isShip = false;
+#endif
+    if (isShip) {
+        m_context.profile.UseExecutableProfilePath();
+    } else if (!options.profilePath.empty()) {
         // -p option
         m_context.profile.UseProfilePath(options.profilePath);
     } else if (options.forceUserProfile) {
@@ -481,7 +490,7 @@ int App::Run(const CommandLineOptions &options) {
     if (!options.gameDiscPath.empty()) {
         // This also inserts the game-specific cartridges or the one configured by the user in Settings > Cartridge
         m_discService.LoadDiscImage(options.gameDiscPath, false);
-    } else if (settings.general.rememberLastLoadedDisc && !m_context.state.recentDiscs.empty()) {
+    } else if ((settings.general.rememberLastLoadedDisc || isShip) && !m_context.state.recentDiscs.empty()) {
         m_discService.LoadDiscImage(m_context.state.recentDiscs[0], false);
     } else {
         m_context.EnqueueEvent(events::emu::InsertCartridgeFromSettings());
@@ -532,6 +541,9 @@ int App::Run(const CommandLineOptions &options) {
 
     RunEmulator();
 
+#ifdef YMIR_RECOMP_NATIVE
+    ship::Shutdown();
+#endif
     return 0;
 }
 
@@ -2039,9 +2051,20 @@ void App::RunEmulator() {
         {
             fmt::memory_buffer buf{};
             auto bufWriter = std::back_inserter(buf);
-            fmt::format_to(bufWriter, "Ymir " Ymir_VERSION);
+#ifdef YMIR_RECOMP_NATIVE
+            const bool shipTitle = ship::Enabled();
+#else
+            const bool shipTitle = false;
+#endif
+            if (shipTitle) {
+#ifdef YMIR_RECOMP_NATIVE
+                fmt::format_to(bufWriter, "{}", ship::WindowTitle());
+#endif
+            } else {
+                fmt::format_to(bufWriter, "Ymir " Ymir_VERSION);
+            }
 
-            if (settings.gui.showGameNameOnTitleBar) {
+            if (settings.gui.showGameNameOnTitleBar && !shipTitle) {
                 fmt::format_to(bufWriter, " - ");
                 std::unique_lock lock{m_context.locks.disc};
                 const media::CDInterface &cdif = m_context.saturn.GetCDInterface();
@@ -2917,6 +2940,9 @@ void App::RunEmulator() {
             // Draw windows and modals
             m_windowManagerService.DrawWindows();
             m_windowManagerService.DrawGenericModal();
+#ifdef YMIR_RECOMP_NATIVE
+            ship::Draw(m_discService);
+#endif
 
             auto *viewport = ImGui::GetMainViewport();
 
@@ -3556,6 +3582,12 @@ void App::EmulatorThread() {
             }
             case OpenHostDevice: //
             {
+#ifdef YMIR_RECOMP_NATIVE
+                if (ship::Enabled()) {
+                    m_context.DisplayMessage("Disc drives are not supported in this build");
+                    break;
+                }
+#endif
                 auto &path = std::get<std::string>(evt.value);
                 // LoadDiscImage locks the disc mutex
                 if (m_context.saturn.instance->OpenHostCDDrive(path)) {
@@ -3574,6 +3606,9 @@ void App::EmulatorThread() {
             }
             case EjectDisc: //
             {
+#ifdef YMIR_RECOMP_NATIVE
+                if (ship::Enabled()) break; // the game disc stays in
+#endif
                 std::unique_lock lock{m_context.locks.disc};
                 m_context.saturn.instance->EjectDisc();
                 m_context.state.loadedDiscImagePath.clear();
