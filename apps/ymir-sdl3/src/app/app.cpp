@@ -354,7 +354,16 @@ int App::Run(const CommandLineOptions &options) {
     // NOTE: Under Flatpak, portable profile isn't allowed; installed profile is forced
 #ifdef YMIR_RECOMP_NATIVE
     // Drydock ship: always portable, next to the executable
-    const bool isShip = ship::Init(m_context, Profile::GetExecutableProfilePath());
+    const bool isShip = ship::Init(
+        ship::Host{
+            .context = &m_context,
+            .settings = &m_settings,
+            .discs = &m_discService,
+            .roms = &m_romService,
+            .openSettings = [this](ui::SettingsTab tab) { m_windowManagerService.SettingsWindow().OpenTab(tab); },
+            .isSettingsOpen = [this] { return m_windowManagerService.SettingsWindow().Open; },
+        },
+        Profile::GetExecutableProfilePath());
 #else
     const bool isShip = false;
 #endif
@@ -513,7 +522,12 @@ int App::Run(const CommandLineOptions &options) {
     // This will also reload persistent SMPC data.
     m_romService.ScanIPLROMs();
     auto iplLoadResult = m_romService.LoadIPLROM();
-    if (!iplLoadResult.succeeded) {
+    if (isShip) {
+#ifdef YMIR_RECOMP_NATIVE
+        // the ship's own setup screen asks for the BIOS
+        ship::Start();
+#endif
+    } else if (!iplLoadResult.succeeded) {
         if (m_context.romManager.GetIPLROMs().empty()) {
             // Could not load IPL ROM because there are none -- likely to be a fresh install, so show the Welcome screen
             m_windowManagerService.OpenWelcomeModal(true);
@@ -1565,6 +1579,14 @@ void App::RunEmulator() {
                 }
 
                 // Handle ESC key press actions
+#ifdef YMIR_RECOMP_NATIVE
+                // Drydock ship: Esc opens and closes the game menu
+                if (evt.key.scancode == SDL_SCANCODE_ESCAPE && evt.key.down && !evt.key.repeat &&
+                    !inputContext.IsCapturing() && ship::OnMenuButton()) {
+                    m_mouseCaptureService.ReleaseAllMice();
+                    break;
+                }
+#endif
                 if (evt.key.scancode == SDL_SCANCODE_ESCAPE && evt.key.down) {
                     // Leave full screen while not focused on ImGui windows
                     if (!io.WantCaptureKeyboard && settings.video.fullScreen) {
@@ -1680,6 +1702,15 @@ void App::RunEmulator() {
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN: [[fallthrough]];
             case SDL_EVENT_GAMEPAD_BUTTON_UP: //
             {
+#ifdef YMIR_RECOMP_NATIVE
+                // Drydock ship: the Guide button opens and closes the game menu
+                if (evt.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE && !inputContext.IsCapturing()) {
+                    if (evt.gbutton.down) {
+                        ship::OnMenuButton();
+                    }
+                    break;
+                }
+#endif
                 const int playerIndex = gamepadPlayerIndices.GetPlayerIndex(evt.gbutton.which);
                 inputContext.ProcessPrimitive(
                     playerIndex, input::SDL3ToGamepadButton((SDL_GamepadButton)evt.gbutton.button), evt.gbutton.down);
@@ -2178,6 +2209,12 @@ void App::RunEmulator() {
         auto *viewport = ImGui::GetMainViewport();
 
         const bool drawMainMenu = [&] {
+#ifdef YMIR_RECOMP_NATIVE
+            // Drydock ship: Ymir's menus only with "Advanced" on
+            if (!ship::ShowYmirMenus()) {
+                return false;
+            }
+#endif
             // Always draw main menu bar in windowed mode
             if (!fullScreen) {
                 return true;
@@ -2941,7 +2978,7 @@ void App::RunEmulator() {
             m_windowManagerService.DrawWindows();
             m_windowManagerService.DrawGenericModal();
 #ifdef YMIR_RECOMP_NATIVE
-            ship::Draw(m_discService);
+            ship::Draw();
 #endif
 
             auto *viewport = ImGui::GetMainViewport();
