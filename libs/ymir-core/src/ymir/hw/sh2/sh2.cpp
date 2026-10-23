@@ -458,6 +458,11 @@ FLATTEN uint64 SH2::Advance(uint64 cycles, uint64 spilloverCycles) {
         // [[maybe_unused]] const uint32 prevPC = PC; // debug aid
 
         // TODO: choose between interpreter (cached or uncached) and JIT recompiler
+        if constexpr (!debug) {
+            if (m_recompDispatch != nullptr && !m_delaySlot && m_recompDispatch(*this, cycles, m_recompCtx)) {
+                continue;
+            }
+        }
         m_cyclesExecuted += InterpretNext<debug, emulateCache>();
 
         // Check for breakpoints and watchpoints and validate PC in debug tracing mode
@@ -4797,6 +4802,53 @@ void SH2::Probe::ExecuteDiv32() {
 
 void SH2::Probe::ExecuteDiv64() {
     m_sh2.ExecuteDiv64<true>();
+}
+
+// -----------------------------------------------------------------------------
+// Static recompilation interface (YmirRecomp)
+
+uint8 SH2::RecompRead8(uint32 address) {
+    return *m_emulateCache ? MemReadByte<true>(address) : MemReadByte<false>(address);
+}
+
+uint16 SH2::RecompRead16(uint32 address) {
+    return *m_emulateCache ? MemReadWord<true>(address) : MemReadWord<false>(address);
+}
+
+uint32 SH2::RecompRead32(uint32 address) {
+    return *m_emulateCache ? MemReadLong<true>(address) : MemReadLong<false>(address);
+}
+
+uint16 SH2::RecompReadCode16(uint32 address) {
+    return *m_emulateCache ? MemReadWord<true, true>(address) : MemReadWord<false, true>(address);
+}
+
+uint32 SH2::RecompReadCode32(uint32 address) {
+    return *m_emulateCache ? MemReadLong<true, true>(address) : MemReadLong<false, true>(address);
+}
+
+void SH2::RecompWrite8(uint32 address, uint8 value) {
+    if (*m_emulateCache) {
+        MemWriteByte<false, true>(address, value);
+    } else {
+        MemWriteByte<false, false>(address, value);
+    }
+}
+
+void SH2::RecompWrite16(uint32 address, uint16 value) {
+    if (*m_emulateCache) {
+        MemWriteWord<false, true>(address, value);
+    } else {
+        MemWriteWord<false, false>(address, value);
+    }
+}
+
+void SH2::RecompWrite32(uint32 address, uint32 value) {
+    if (*m_emulateCache) {
+        MemWriteLong<false, true>(address, value);
+    } else {
+        MemWriteLong<false, false>(address, value);
+    }
 }
 
 } // namespace ymir::sh2

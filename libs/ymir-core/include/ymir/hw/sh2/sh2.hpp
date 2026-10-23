@@ -40,6 +40,10 @@
 #include <map>
 #include <set>
 
+namespace ymir_recomp {
+struct CPU;
+} // namespace ymir_recomp
+
 namespace ymir::sh2 {
 
 // -----------------------------------------------------------------------------
@@ -652,6 +656,36 @@ public:
         return m_probe;
     }
 
+    // -------------------------------------------------------------------------
+    // Static recompilation interface (YmirRecomp)
+    //
+    // Recompiled code reads and writes guest state directly through
+    // ymir_recomp::CPU and performs real, side-effecting memory accesses through
+    // these functions. They honor the current SH-2 cache emulation setting, so
+    // the bus, cache and on-chip registers behave exactly as for the interpreter.
+
+    uint8 RecompRead8(uint32 address);
+    uint16 RecompRead16(uint32 address);
+    uint32 RecompRead32(uint32 address);
+    uint16 RecompReadCode16(uint32 address); // PC-relative data: instruction-fetch path
+    uint32 RecompReadCode32(uint32 address);
+    void RecompWrite8(uint32 address, uint8 value);
+    void RecompWrite16(uint32 address, uint16 value);
+    void RecompWrite32(uint32 address, uint32 value);
+
+    friend struct ::ymir_recomp::CPU;
+
+    /// Native code dispatcher, consulted before each interpreted instruction
+    /// (outside delay slots, non-debug execution only). It runs recompiled code
+    /// for the current PC if it has any and returns true if it made progress;
+    /// false makes the interpreter execute the instruction as usual.
+    using RecompDispatchFn = bool (*)(SH2 &sh2, uint64 cycleBudget, void *ctx);
+
+    void SetRecompDispatch(RecompDispatchFn fn, void *ctx) {
+        m_recompDispatch = fn;
+        m_recompCtx = ctx;
+    }
+
 private:
     // -------------------------------------------------------------------------
     // CPU state
@@ -672,6 +706,10 @@ private:
 
     uint32 m_delaySlotTarget;
     bool m_delaySlot;
+
+    // Static recompilation dispatcher (YmirRecomp); null = interpreter only.
+    RecompDispatchFn m_recompDispatch = nullptr;
+    void *m_recompCtx = nullptr;
 
     // Raw opcodes fetched from memory.
     // The CPU always does aligned 32-bit instruction fetches pulling in a pair of 16-bit instructions.

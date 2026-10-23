@@ -558,6 +558,23 @@ target_link_libraries(ymir-sdl3 PRIVATE
     stb::stb
     dr_libs::dr_libs
 )
+## YmirRecomp: link recompiled game code into the frontend
+set(YMIR_RECOMP_ROOT "" CACHE PATH "YmirRecomp checkout (enables recompiled code)")
+set(YMIR_RECOMP_GENERATED "" CACHE FILEPATH "Generated native code (sh2recomp output)")
+if (YMIR_RECOMP_ROOT AND YMIR_RECOMP_GENERATED)
+    message(STATUS "YmirRecomp: linking ${YMIR_RECOMP_GENERATED}")
+    target_sources(ymir-sdl3 PRIVATE ${YMIR_RECOMP_ROOT}/runtime/src_runtime.cpp ${YMIR_RECOMP_GENERATED})
+    target_include_directories(ymir-sdl3 PRIVATE ${YMIR_RECOMP_ROOT}/runtime/include)
+    target_compile_definitions(ymir-sdl3 PRIVATE YMIR_RECOMP_NATIVE)
+    # The generated file is huge and goto-heavy: moderate optimization, no LTO.
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set_source_files_properties(${YMIR_RECOMP_GENERATED} PROPERTIES COMPILE_OPTIONS "/O1;/clang:-fno-lto")
+    else ()
+        set_source_files_properties(${YMIR_RECOMP_GENERATED} PROPERTIES COMPILE_OPTIONS "-O1;-fno-lto")
+    endif ()
+    set_source_files_properties(${YMIR_RECOMP_GENERATED} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif ()
+
 if (WIN32)
     target_link_libraries(ymir-sdl3 PRIVATE
         Dwmapi
