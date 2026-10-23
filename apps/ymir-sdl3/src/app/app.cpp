@@ -83,6 +83,10 @@
 
 #include <ymir/sys/saturn.hpp>
 
+#ifdef YMIR_RECOMP_NATIVE
+    #include <ymir_recomp/runtime.hpp>
+#endif
+
 #include <ymir/media/host_cd.hpp>
 
 #include <ymir/util/lsn_denormals.hpp>
@@ -3121,6 +3125,13 @@ void App::RunEmulator() {
                                     screen.lastVDP2Frames, screen.lastVDP1Frames, screen.lastVDP1DrawCalls,
                                     io.Framerate, currSpeed, speedStr);
                 }
+#ifdef YMIR_RECOMP_NATIVE
+                // YmirRecomp: share of SH-2 work running as recompiled code
+                if (const auto *rt = ymir_recomp::Runtime::Active()) {
+                    const float share = rt->NativeShare();
+                    fpsText += share < 0.0f ? "\nNative: off" : fmt::format("\nNative: {:.0f}%", share * 100.0f);
+                }
+#endif
 
                 auto *drawList = ImGui::GetBackgroundDrawList();
                 bool top, left;
