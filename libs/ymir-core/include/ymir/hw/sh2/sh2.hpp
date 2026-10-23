@@ -673,6 +673,22 @@ public:
     void RecompWrite16(uint32 address, uint16 value);
     void RecompWrite32(uint32 address, uint32 value);
 
+    // Same accesses, also adding the access cycles the interpreter charges for
+    // them (computed before the access, as the interpreter does) to `cycles`.
+    uint8 RecompRead8C(uint32 address, uint64 &cycles);
+    uint16 RecompRead16C(uint32 address, uint64 &cycles);
+    uint32 RecompRead32C(uint32 address, uint64 &cycles);
+    uint16 RecompReadCode16C(uint32 address, uint64 &cycles);
+    uint32 RecompReadCode32C(uint32 address, uint64 &cycles);
+    void RecompWrite8C(uint32 address, uint8 value, uint64 &cycles);
+    void RecompWrite16C(uint32 address, uint16 value, uint64 &cycles);
+    void RecompWrite32C(uint32 address, uint32 value, uint64 &cycles);
+
+    // Access cycles alone (read-modify-write instructions charge them with
+    // their own sizes) and the TAS.B read-modify-write cost.
+    uint64 RecompAccessCycles(uint32 address, uint32 size, bool write);
+    uint64 RecompAccessCyclesRMWByte(uint32 address);
+
     friend struct ::ymir_recomp::CPU;
 
     /// Native code dispatcher, consulted before each interpreted instruction

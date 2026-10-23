@@ -4851,4 +4851,98 @@ void SH2::RecompWrite32(uint32 address, uint32 value) {
     }
 }
 
+uint8 SH2::RecompRead8C(uint32 address, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint8, false, true>(address);
+        return MemReadByte<true>(address);
+    }
+    cycles += AccessCycles<uint8, false, false>(address);
+    return MemReadByte<false>(address);
+}
+
+uint16 SH2::RecompRead16C(uint32 address, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint16, false, true>(address);
+        return MemReadWord<true>(address);
+    }
+    cycles += AccessCycles<uint16, false, false>(address);
+    return MemReadWord<false>(address);
+}
+
+uint32 SH2::RecompRead32C(uint32 address, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint32, false, true>(address);
+        return MemReadLong<true>(address);
+    }
+    cycles += AccessCycles<uint32, false, false>(address);
+    return MemReadLong<false>(address);
+}
+
+uint16 SH2::RecompReadCode16C(uint32 address, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint16, false, true>(address);
+        return MemReadWord<true, true>(address);
+    }
+    cycles += AccessCycles<uint16, false, false>(address);
+    return MemReadWord<false, true>(address);
+}
+
+uint32 SH2::RecompReadCode32C(uint32 address, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint32, false, true>(address);
+        return MemReadLong<true, true>(address);
+    }
+    cycles += AccessCycles<uint32, false, false>(address);
+    return MemReadLong<false, true>(address);
+}
+
+void SH2::RecompWrite8C(uint32 address, uint8 value, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint8, true, true>(address);
+        MemWriteByte<false, true>(address, value);
+    } else {
+        cycles += AccessCycles<uint8, true, false>(address);
+        MemWriteByte<false, false>(address, value);
+    }
+}
+
+void SH2::RecompWrite16C(uint32 address, uint16 value, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint16, true, true>(address);
+        MemWriteWord<false, true>(address, value);
+    } else {
+        cycles += AccessCycles<uint16, true, false>(address);
+        MemWriteWord<false, false>(address, value);
+    }
+}
+
+void SH2::RecompWrite32C(uint32 address, uint32 value, uint64 &cycles) {
+    if (*m_emulateCache) {
+        cycles += AccessCycles<uint32, true, true>(address);
+        MemWriteLong<false, true>(address, value);
+    } else {
+        cycles += AccessCycles<uint32, true, false>(address);
+        MemWriteLong<false, false>(address, value);
+    }
+}
+
+uint64 SH2::RecompAccessCycles(uint32 address, uint32 size, bool write) {
+    const bool cache = *m_emulateCache;
+    switch (size) {
+    case 1:
+        return write ? (cache ? AccessCycles<uint8, true, true>(address) : AccessCycles<uint8, true, false>(address))
+                     : (cache ? AccessCycles<uint8, false, true>(address) : AccessCycles<uint8, false, false>(address));
+    case 2:
+        return write ? (cache ? AccessCycles<uint16, true, true>(address) : AccessCycles<uint16, true, false>(address))
+                     : (cache ? AccessCycles<uint16, false, true>(address) : AccessCycles<uint16, false, false>(address));
+    default:
+        return write ? (cache ? AccessCycles<uint32, true, true>(address) : AccessCycles<uint32, true, false>(address))
+                     : (cache ? AccessCycles<uint32, false, true>(address) : AccessCycles<uint32, false, false>(address));
+    }
+}
+
+uint64 SH2::RecompAccessCyclesRMWByte(uint32 address) {
+    return *m_emulateCache ? AccessCyclesRMWByte<true>(address) : AccessCyclesRMWByte<false>(address);
+}
+
 } // namespace ymir::sh2
