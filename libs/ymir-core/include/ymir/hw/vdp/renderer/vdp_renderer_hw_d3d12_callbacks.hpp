@@ -23,10 +23,12 @@ namespace ymir::vdp {
 /// @param[in] fenceValue the fence value to wait for
 /// @param[in] width the current display width
 /// @param[in] height the current display height
+/// @param[in] scale the internal resolution scale of this frame (width and height include it)
 /// @return a pointer to a 2D texture with `ymir::vdp::kMaxResH` by `ymir::vdp::kMaxResV` pixels and using
 /// R8G8B8A8_UNORM pixel format. Return `nullptr` to omit the copy for this frame.
 using CBDirect3D12FrameCopyRequestCallback =
-    util::OptionalCallback<ID3D12Resource *(ID3D12Fence *computeFence, uint64 fenceValue, uint32 width, uint32 height)>;
+    util::OptionalCallback<ID3D12Resource *(ID3D12Fence *computeFence, uint64 fenceValue, uint32 width, uint32 height,
+                                            uint32 scale)>;
 
 /// @brief Callbacks specific to the Direct3D 12 VDP renderer.
 struct Direct3D12RendererCallbacks {

@@ -86,10 +86,15 @@ RWBuffer<uint> g_internalSpriteOut : register(u1);
 // ---------------------------------------------------------------------------------------------------------------------
 // Parameters
 
+// Internal resolution scale: coordinates are in scaled pixels, the framebuffers are kScale times larger on each axis
+static const uint kScale = BitExtract(g_commonParams.enhancements, 2, 3) + 1u;
+static const uint kFBSizeS = kVDP1FBSize * kScale * kScale;
+static const uint kFBRAMSizeS = kVDP1FBRAMSize * kScale * kScale;
+
 static const uint2 fbSize = uint2(
     512u << BitExtract(g_commonParams.displayParams, 0, 1),
     256u << BitExtract(g_commonParams.displayParams, 1, 1)
-);
+) * kScale;
 static const bool pixel8Bits = BitTest(g_commonParams.displayParams, 2);
 static const bool doubleDensity = BitTest(g_commonParams.displayParams, 3);
 static const bool dblInterlaceEnable = BitTest(g_commonParams.displayParams, 4);
@@ -500,7 +505,7 @@ void WriteOutput(int2 coord, OutData data) {
         BitExtract(cmdParams.sysClip, 0, 16),
         BitExtract(cmdParams.sysClip, 16, 16)
     );
-    if (any(coord < 0) || any(coord > sysClip)) {
+    if (any(coord < 0) || any(coord > int2(sysClip * kScale + (kScale - 1u)))) {
         return;
     }
 
@@ -516,7 +521,7 @@ void WriteOutput(int2 coord, OutData data) {
             BitExtract(cmdParams.userClip1, 0, 16),
             BitExtract(cmdParams.userClip1, 16, 16)
         );
-        if ((any(coord < userClip0) || any(coord > userClip1)) != clippingMode) {
+        if ((any(coord < int2(userClip0 * kScale)) || any(coord > int2(userClip1 * kScale + (kScale - 1u)))) != clippingMode) {
             return;
         }
     }
@@ -531,22 +536,24 @@ void WriteOutput(int2 coord, OutData data) {
 
 #if POLYSPEC_SHADING_MODE == POLYSPEC_SHADING_MODE_MSB
     const uint drawFB = BitExtract(g_commonParams.displayParams, 7, 1);
-    uint fbOffset = drawFB * kVDP1FBSize;
+    uint fbOffset = drawFB * kFBSizeS;
 #endif
 
-    // Interlace line selection
-    if (!deinterlace && doubleDensity && dblInterlaceEnable && (coord.y & 1) != dblInterlaceDrawLine) {
+    // Interlace line selection (on unscaled lines)
+    const uint lineY = uint(coord.y) / kScale;
+    const uint subY = uint(coord.y) % kScale;
+    if (!deinterlace && doubleDensity && dblInterlaceEnable && (lineY & 1) != dblInterlaceDrawLine) {
         return;
     }
-    if (deinterlace && doubleDensity && (coord.y & 1) != 0) {
+    if (deinterlace && doubleDensity && (lineY & 1) != 0) {
 #if POLYSPEC_SHADING_MODE == POLYSPEC_SHADING_MODE_MSB
-        fbOffset += kVDP1FBRAMSize;
+        fbOffset += kFBRAMSizeS;
 #else
         outOffset += fbSize.x * fbSize.y;
 #endif
     }
     if ((deinterlace && doubleDensity) || dblInterlaceEnable) {
-        coord.y >>= 1;
+        coord.y = int((lineY >> 1) * kScale + subY);
     }
 
     outOffset += coord.y * fbSize.x + coord.x;

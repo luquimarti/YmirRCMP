@@ -467,6 +467,9 @@ int App::Run(const CommandLineOptions &options) {
         }
     }};
 
+    // Internal resolution of the hardware renderer, fixed for this run
+    ymir::vdp::config::hwInternalScale = settings.video.enhancements.internalResolution;
+
     if (!m_context.profile.CheckFolders()) {
         std::error_code error{};
         if (!m_context.profile.CreateFolders(error)) {
@@ -820,6 +823,9 @@ void App::RunEmulator() {
         ShowStartupFailure("Failed to create window: {}", SDL_GetError());
         return;
     }
+#ifdef YMIR_RECOMP_NATIVE
+    ship::ApplyWindowIcon(screen.window);
+#endif
     ScopeGuard sgDestroyWindow{[&] {
         m_displayService.PersistWindowGeometry();
         SDL_DestroyWindow(screen.window);
@@ -960,6 +966,68 @@ void App::RunEmulator() {
     }
     const gfx::GUITextureHandle dispTexture = dispTextureResult.Value();
 
+    // Internal resolution scale of the last displayed hardware frame
+    uint32 hwFrameScale = 1;
+
+    // Dynamic resolution: lowers the hardware renderer's internal resolution when emulation can't keep full speed,
+    // and raises it again once it does, waiting longer each time it has to drop right after a raise.
+    struct DynamicResolutionState {
+        uint32 current = 0;
+        clk::time_point holdUntil{};
+        clk::time_point raiseAt{};
+        clk::time_point lastRaise{};
+        clk::duration raiseDelay = std::chrono::seconds(8);
+        uint32 lastWidth = 0;
+        uint32 lastHeight = 0;
+    } dynRes;
+    auto updateDynamicResolution = [&](clk::time_point now) {
+        using namespace std::chrono_literals;
+        const uint32 allocated = vdp::config::GetHWInternalScale();
+        if (!settings.video.useHardwareAcceleration || allocated <= 1) {
+            vdp::config::hwRequestedScale = 0;
+            return;
+        }
+        const uint32 userMax = std::clamp<uint32>(settings.video.enhancements.internalResolution, 1u, allocated);
+        // Steps from the maximum down to 1x: 4x -> 2x -> 1x, 3x -> 2x -> 1x, 2x -> 1x
+        auto lower = [](uint32 s) { return s >= 4 ? 2u : s > 1 ? s - 1u : 1u; };
+        auto higher = [&](uint32 s) { return s == 1 ? std::min(2u, userMax) : userMax; };
+
+        uint32 &cur = dynRes.current;
+        // A new video mode is a new scene: go back to the maximum and start measuring afresh
+        const bool modeChanged = screen.width != dynRes.lastWidth || screen.height != dynRes.lastHeight;
+        dynRes.lastWidth = screen.width;
+        dynRes.lastHeight = screen.height;
+        if (cur == 0 || cur > userMax || !settings.video.enhancements.dynamicResolution || modeChanged) {
+            cur = userMax;
+            dynRes.raiseDelay = 8s;
+            dynRes.holdUntil = now + 2s;
+        } else {
+            const auto &speed = m_context.emuSpeed;
+            const bool measuring = !m_context.paused && speed.limitSpeed && !speed.altSpeed &&
+                                   speed.GetCurrentSpeedFactor() == 1.0 && now >= dynRes.holdUntil;
+            if (measuring) {
+                const double frameInterval = screen.frameInterval.count() * 0.000000001;
+                const double emuSpeed = screen.lastVDP2Frames * frameInterval; // 1.0 = full speed
+                if (emuSpeed < 0.95 && cur > 1) {
+                    cur = lower(cur);
+                    if (now - dynRes.lastRaise < 15s) {
+                        dynRes.raiseDelay = std::min<clk::duration>(dynRes.raiseDelay * 2, 30s);
+                    }
+                    dynRes.holdUntil = now + 2s;
+                    dynRes.raiseAt = now + dynRes.raiseDelay;
+                } else if (emuSpeed >= 0.99 && cur < userMax && now >= dynRes.raiseAt) {
+                    cur = higher(cur);
+                    dynRes.lastRaise = now;
+                    dynRes.holdUntil = now + 2s;
+                } else if (now - dynRes.lastRaise > 60s) {
+                    // Stable for a while: forget earlier failed raises
+                    dynRes.raiseDelay = 8s;
+                }
+            }
+        }
+        vdp::config::hwRequestedScale = cur;
+    };
+
     auto renderDispTexture = [&](double targetWidth, double targetHeight) {
         auto &videoSettings = settings.video;
         const bool forceAspectRatio = videoSettings.forceAspectRatio;
@@ -970,7 +1038,10 @@ void App::RunEmulator() {
         const double dispScaleX = (double)targetWidth / dispWidth;
         const double dispScaleY = (double)targetHeight / dispHeight;
         const double dispScale = std::min(dispScaleX, dispScaleY);
-        const uint32 scale = std::max(1.0, ceil(dispScale));
+        // With a higher internal resolution the hardware frame is hwScale times larger; keep the display texture an
+        // integer multiple of it so that pixels stay uniform
+        const uint32 hwScale = videoSettings.useHardwareAcceleration ? vdp::config::GetHWInternalScale() : 1u;
+        const uint32 scale = static_cast<uint32>(std::max(1.0, ceil(dispScale / hwScale))) * hwScale;
 
         assert(m_graphicsService.IsTextureHandleValid(dispTexture));
         assert(m_graphicsService.IsTextureHandleValid(swFbTexture));
@@ -995,10 +1066,16 @@ void App::RunEmulator() {
             gfx::IGraphicsContext &gfxCtx = m_graphicsService.GetGraphicsContext();
             const std::optional<gfx::DisplayTextureSpec> hwFbTexture = gfxCtx.AcquireCurrentDisplayOutputTexture();
             if (hwFbTexture) {
-                screen.SetResolution(hwFbTexture->width, hwFbTexture->height);
+                // The renderer outputs the Saturn resolution times the frame's internal resolution scale
+                const uint32 frameScale = std::max(hwFbTexture->scale, 1u);
+                hwFrameScale = frameScale;
+                screen.SetResolution(hwFbTexture->width / frameScale, hwFbTexture->height / frameScale);
 
                 const gfx::TextureID dispTextureID = m_graphicsService.GetTextureID(dispTexture);
-                gfx::FRect srcRect{.x = 0.0f, .y = 0.0f, .w = (float)screen.width, .h = (float)screen.height};
+                gfx::FRect srcRect{.x = 0.0f,
+                                   .y = 0.0f,
+                                   .w = (float)hwFbTexture->width,
+                                   .h = (float)hwFbTexture->height};
                 gfxCtx.RenderToTexture(hwFbTexture->id, dispTextureID, srcRect, dstRect);
                 gfxCtx.ReleaseCurrentDisplayOutputTexture();
             }
@@ -2009,9 +2086,15 @@ void App::RunEmulator() {
                 ss.fbWidth = screen.width;
                 ss.fbHeight = screen.height;
                 if (vdp.GetRenderer().IsHardwareRenderer()) {
-                    // Hardware renderers always copy the full resolution texture
-                    ss.fb.resize(vdp::kMaxResH * vdp::kMaxResV);
-                    const size_t framebufferSize = vdp::kMaxResH * vdp::kMaxResV * sizeof(uint32);
+                    // Hardware renderers always copy the full resolution texture, scaled by the internal resolution
+                    const uint32 hwScale = hwFrameScale;
+                    const uint32 texWidth = vdp::kMaxResH * vdp::config::GetHWInternalScale();
+                    const uint32 shotWidth = screen.width * hwScale;
+                    const uint32 shotHeight = screen.height * hwScale;
+                    ss.fbWidth = shotWidth;
+                    ss.fbHeight = shotHeight;
+                    ss.fb.resize(texWidth * vdp::kMaxResV * vdp::config::GetHWInternalScale());
+                    const size_t framebufferSize = ss.fb.size() * sizeof(uint32);
                     gfx::IGraphicsContext &gfxCtx = m_graphicsService.GetGraphicsContext();
                     auto result = gfxCtx.DownloadDisplayOutputTexture(ss.fb.data(), framebufferSize);
                     if (result) {
@@ -2027,12 +2110,12 @@ void App::RunEmulator() {
                     }
 
                     // Shrink it down to size in-place
-                    for (uint32 y = 1; y < screen.height; ++y) {
-                        const size_t srcPos = y * vdp::kMaxResH;
-                        const size_t dstPos = y * screen.width;
-                        std::copy_n(&ss.fb[srcPos], screen.width, &ss.fb[dstPos]);
+                    for (uint32 y = 1; y < shotHeight; ++y) {
+                        const size_t srcPos = y * texWidth;
+                        const size_t dstPos = y * shotWidth;
+                        std::copy_n(&ss.fb[srcPos], shotWidth, &ss.fb[dstPos]);
                     }
-                    ss.fb.resize(screen.width * screen.height);
+                    ss.fb.resize(shotWidth * shotHeight);
                 } else {
                     // The software renderer already outputs the frame in a compact vector
                     ss.fb.resize(screen.width * screen.height);
@@ -2163,6 +2246,7 @@ void App::RunEmulator() {
                 screen.VDP1Frames = 0;
                 screen.VDP1DrawCalls = 0;
                 t = now;
+                updateDynamicResolution(now);
             }
         }
 
@@ -3187,6 +3271,9 @@ void App::RunEmulator() {
                         fmt::format("VDP2: {} fps\nVDP1: {} fps\nVDP1: {} draws\nGUI: {:.0f} fps\nSpeed: {:.0f}% / {}",
                                     screen.lastVDP2Frames, screen.lastVDP1Frames, screen.lastVDP1DrawCalls,
                                     io.Framerate, currSpeed, speedStr);
+                }
+                if (settings.video.useHardwareAcceleration && vdp::config::GetHWInternalScale() > 1) {
+                    fpsText += fmt::format("\nResolution: {}x", hwFrameScale);
                 }
 #ifdef YMIR_RECOMP_NATIVE
                 // YmirRecomp: share of SH-2 work running as recompiled code

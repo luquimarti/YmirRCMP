@@ -173,6 +173,16 @@ struct Direct3D12VDPRenderer::Impl {
     VDPState &vdpState;
     const config::Enhancements &enhancements;
 
+    /// @brief Counter width of the VDP1 edge steppers when the internal resolution is scaled (up to 4x = 2 more bits).
+    static constexpr sint32 kScaledStepperBits = 15;
+
+    /// @brief Maximum internal resolution scale. Resources are allocated for it; fixed for the renderer's lifetime.
+    uint32 maxScale = 1;
+
+    /// @brief Current internal resolution scale (1 = native, up to `maxScale`). May change between frames.
+    /// The VDP1 framebuffers, the VDP2 layer outputs and the composite output are `scale` times larger on each axis.
+    uint32 scale = 1;
+
     const Direct3D12RendererCallbacks &hwCallbacks;
 
     D3D12Device device;
@@ -260,6 +270,30 @@ struct Direct3D12VDPRenderer::Impl {
         DescriptorRange fbramWritesSRV;
         /// @brief CPU-side list of FBRAM writes.
         std::vector<VDP1FBRAMWrite> cpuFBRAMWritesList;
+
+        /// @brief Native-sized FBRAM buffer (internal resolution scale > 1 only).
+        /// Receives a downsampled copy of the scaled framebuffers for CPU readback.
+        D3D12Resource fbramNativeBuffer;
+        /// @brief Native-sized FBRAM buffer SRV (offline).
+        DescriptorRange fbramNativeSRV;
+        /// @brief Native-sized FBRAM buffer UAV (offline).
+        DescriptorRange fbramNativeUAV;
+
+        /// @brief Compute shader for upsampling native FBRAM into the scaled framebuffers (scale changes).
+        gpu::ComputeShader fbramUpsampleShader;
+        /// @brief Descriptor range for upsampling (shares the downsample root signature).
+        DescriptorTable fbramUpsampleDescs;
+        /// @brief Pipeline state object for upsampling.
+        D3D12PipelineState fbramUpsamplePSO;
+
+        /// @brief Compute shader for downsampling the scaled framebuffers.
+        gpu::ComputeShader fbramDownsampleShader;
+        /// @brief Root signature for downsampling the scaled framebuffers.
+        D3D12RootSignature fbramDownsampleRootSig;
+        /// @brief Descriptor range for downsampling the scaled framebuffers.
+        DescriptorTable fbramDownsampleDescs;
+        /// @brief Pipeline state object for downsampling the scaled framebuffers.
+        D3D12PipelineState fbramDownsamplePSO;
 
         /// @brief FBRAM download buffer.
         D3D12Resource fbramDownloadBuffer;
@@ -1266,6 +1300,13 @@ struct Direct3D12VDPRenderer::Impl {
     util::VoidResult<> Initialize(ID3D12Device *pDevice) {
         device.Assign(pDevice);
 
+        maxScale = config::GetHWInternalScale();
+        scale = maxScale;
+        vdp1.cpuCommonRenderParams.enhancements.internalScaleM1 = scale - 1u;
+        vdp2.cpuCommonRenderParams.enhancements.internalScaleM1 = scale - 1u;
+        config::hwCurrentScale = scale;
+        devlog::info<grp::dx12_base>("Internal resolution scale: up to {}x", maxScale);
+
         // Check features
         D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
         if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12, sizeof(options12)))) {
@@ -1363,7 +1404,8 @@ struct Direct3D12VDPRenderer::Impl {
                                           // *2 for the the two framebuffers in VDP1 FBRAM.
                                           // *2 for deinterlace alternate field buffers.
                                           // *2 for transparent mesh buffers.
-                                          kVDP1FBRAMSize * 2 * 2 * 2,
+                                          // *scale^2 for the internal resolution enhancement.
+                                          kVDP1FBRAMSize * 2 * 2 * 2 * maxScale * maxScale,
                                           {
 
                                               .srv = &vdp1.fbramSRV,
@@ -1407,6 +1449,61 @@ struct Direct3D12VDPRenderer::Impl {
             if (HRESULT hr = vdp1.fbramDownloadBuffer->Map(0, nullptr, &vdp1.fbramDownloadBufferPtr); FAILED(hr)) {
                 return util::ErrorMessage{
                     fmt::format("Could not map VDP1 FBRAM download buffer, error code {:X}", (uint32)hr)};
+            }
+        }
+
+        // Native-sized FBRAM and downsampling shader for CPU readback when rendering at a higher internal resolution
+        if (maxScale > 1) {
+            if (auto result = CreateRawBuffer(vdp1.fbramNativeBuffer, kVDP1FBRAMSize * 2,
+                                              {
+                                                  .srv = &vdp1.fbramNativeSRV,
+                                                  .uav = &vdp1.fbramNativeUAV,
+                                                  .name = "[Ymir-VDP1] Native FBRAM buffer",
+                                              });
+                !result) {
+                return result;
+            }
+            barrierTracker.InitializeBuffer(vdp1.fbramNativeBuffer.GetPointer(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+
+            if (auto result = CreateShader(vdp1.fbramDownsampleShader, "src/vdp/cs_vdp1_fbram_downsample.cso");
+                !result) {
+                return util::ErrorMessage{fmt::format("Could not create VDP1 framebuffer downsample compute shader: {}",
+                                                      result.Error().message)};
+            }
+            const RootSignatureSpec rootSigSpec{
+                .constantsSize = sizeof(VDP1CommonRenderParams),
+                .numSRVs = 1,
+                .numUAVs = 1,
+                .name = "[Ymir-VDP1] Framebuffer downsample root signature",
+            };
+            if (auto result = CreateRootSignature(vdp1.fbramDownsampleRootSig, rootSigSpec); !result) {
+                return result;
+            }
+            if (auto result = CreatePSO(vdp1.fbramDownsamplePSO, vdp1.fbramDownsampleRootSig,
+                                        vdp1.fbramDownsampleShader,
+                                        "[Ymir-VDP1] Framebuffer downsample pipeline state object");
+                !result) {
+                return result;
+            }
+            vdp1.fbramDownsampleDescs.Bind(&vdp1.fbramSRV, &vdp1.fbramNativeUAV);
+            if (!vdp1.fbramDownsampleDescs.Rebuild(device, resourceHeapAlloc, resourceHeap.GetHeapType())) {
+                return util::ErrorMessage{"Could not allocate VDP1 framebuffer downsample descriptors"};
+            }
+
+            // Upsampling (changing the scale at runtime): native FBRAM -> scaled framebuffers
+            if (auto result = CreateShader(vdp1.fbramUpsampleShader, "src/vdp/cs_vdp1_fbram_upsample.cso"); !result) {
+                return util::ErrorMessage{fmt::format("Could not create VDP1 framebuffer upsample compute shader: {}",
+                                                      result.Error().message)};
+            }
+            if (auto result = CreatePSO(vdp1.fbramUpsamplePSO, vdp1.fbramDownsampleRootSig, vdp1.fbramUpsampleShader,
+                                        "[Ymir-VDP1] Framebuffer upsample pipeline state object");
+                !result) {
+                return result;
+            }
+            vdp1.fbramUpsampleDescs.Bind(&vdp1.fbramNativeSRV, &vdp1.fbramUAV);
+            if (!vdp1.fbramUpsampleDescs.Rebuild(device, resourceHeapAlloc, resourceHeap.GetHeapType())) {
+                return util::ErrorMessage{"Could not allocate VDP1 framebuffer upsample descriptors"};
             }
         }
 
@@ -1583,7 +1680,8 @@ struct Direct3D12VDPRenderer::Impl {
                     // MSBsto enable parallel rendering with guaranteed pixel ordering.
                     // *2 for deinterlace alternate field
                     // *2 for transparent mesh buffer
-                    kVDP1FBRAMSize * 2 * 2,
+                    // *scale^2 for the internal resolution enhancement
+                    kVDP1FBRAMSize * 2 * 2 * maxScale * maxScale,
                     {
                         .uav = &frameCtx.internalSpriteOutUAV,
                         .name = fmt::format("[Ymir-VDP1] Internal sprite data output buffer #{}", i),
@@ -1602,7 +1700,8 @@ struct Direct3D12VDPRenderer::Impl {
                     // Entries are 32-bit, holding the index of the head of the list.
                     // *2 for deinterlace alternate field
                     // *2 for transparent mesh buffer
-                    kVDP1FBRAMSize * 2 * 2,
+                    // *scale^2 for the internal resolution enhancement
+                    kVDP1FBRAMSize * 2 * 2 * maxScale * maxScale,
                     {
                         .uav = &frameCtx.oitListHeadsUAV,
                         .name = fmt::format("[Ymir-VDP1] OIT fragments list heads buffer #{}", i),
@@ -1732,7 +1831,8 @@ struct Direct3D12VDPRenderer::Impl {
                                         D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
 
         // Composited VDP2 output texture
-        if (auto result = Create2DTexture(vdp2.compositeOutTexture, DXGI_FORMAT_R8G8B8A8_UNORM, kMaxResH, kMaxResV,
+        if (auto result = Create2DTexture(vdp2.compositeOutTexture, DXGI_FORMAT_R8G8B8A8_UNORM, kMaxResH * maxScale,
+                                          kMaxResV * maxScale,
                                           {
                                               .uav = &vdp2.compositeOutUAV,
                                               .name = "[Ymir-VDP2] Composited output texture",
@@ -1837,7 +1937,8 @@ struct Direct3D12VDPRenderer::Impl {
 
             // Layer outputs 2D texture array
             if (auto result =
-                    Create2DTextureArray(frameCtx.layerOutTexture, DXGI_FORMAT_R8G8B8A8_UINT, kMaxResH, kMaxResV,
+                    Create2DTextureArray(frameCtx.layerOutTexture, DXGI_FORMAT_R8G8B8A8_UINT, kMaxResH * maxScale,
+                                         kMaxResV * maxScale,
                                          // The array contains:
                                          //   [0..3] NBG0-3
                                          //   [4..5] RBG0-1
@@ -1920,7 +2021,8 @@ struct Direct3D12VDPRenderer::Impl {
 
             // VDP2 sprite attributes 2D texture array
             if (auto result =
-                    Create2DTextureArray(frameCtx.spriteAttrsTexture, DXGI_FORMAT_R16_UINT, kMaxResH, kMaxResV, 2,
+                    Create2DTextureArray(frameCtx.spriteAttrsTexture, DXGI_FORMAT_R16_UINT, kMaxResH * maxScale,
+                                         kMaxResV * maxScale, 2,
                                          {
                                              .srv = &frameCtx.spriteAttrsSRV,
                                              .uav = &frameCtx.spriteAttrsUAV,
@@ -2024,16 +2126,31 @@ struct Direct3D12VDPRenderer::Impl {
                                             D3D12_BARRIER_ACCESS_COPY_DEST);
             barrierTracker.Flush(cmdList);
 
-            // Upload default values
-            UploadAllocation alloc{};
-            const size_t size = kVDP1FBRAMSize * 2 * sizeof(HLSLuint);
-            if (auto result = AllocateUploadBuffer(uploadBuffer, size, 4, alloc); !result) {
-                return util::ErrorMessage{fmt::format(
-                    "Failed to allocate upload buffer for VDP1 OIT fragment list heads: {}", result.Error().message)};
-            }
-            std::fill_n(static_cast<HLSLuint *>(alloc.data), kVDP1FBRAMSize * 2, 0xFFFFFFFF);
+            // Upload default values, in chunks that fit the upload buffer
+            const size_t totalCount = static_cast<size_t>(kVDP1FBRAMSize) * 2 * 2 * maxScale * maxScale;
+            static constexpr size_t kChunkCount = 1024 * 1024;
+            for (size_t offset = 0; offset < totalCount; offset += kChunkCount) {
+                const size_t count = std::min(kChunkCount, totalCount - offset);
+                const size_t size = count * sizeof(HLSLuint);
+                UploadAllocation alloc{};
+                if (auto result = AllocateUploadBuffer(uploadBuffer, size, 4, alloc); !result) {
+                    return util::ErrorMessage{fmt::format("Failed to allocate upload buffer for VDP1 OIT fragment list heads: {}",
+                                                          result.Error().message)};
+                }
+                std::fill_n(static_cast<HLSLuint *>(alloc.data), count, 0xFFFFFFFF);
 
-            cmdList->CopyBufferRegion(dstResource, 0, uploadBufferPtr, alloc.offset, size);
+                cmdList->CopyBufferRegion(dstResource, offset * sizeof(HLSLuint), uploadBufferPtr, alloc.offset, size);
+
+                // Large (scaled) buffers need several upload buffer fills: submit what we have so far so that the
+                // upload buffer space can be reclaimed once the GPU is done with it
+                if (offset + count < totalCount) {
+                    uploadBuffer.EndFrame(frames.GetNextFenceValue());
+                    if (auto result = SubmitCommandList(); !result) {
+                        return util::ErrorMessage{fmt::format("Failed to submit VDP1 OIT fragment list heads upload: {}",
+                                                              result.Error().message)};
+                    }
+                }
+            }
         }
 
         return {};
@@ -2112,6 +2229,7 @@ struct Direct3D12VDPRenderer::Impl {
         VDP1CommonRenderParams &params1 = vdp1.cpuCommonRenderParams;
         params1.enhancements.deinterlace = enhancements.deinterlace;
         params1.enhancements.transparentMeshes = enhancements.transparentMeshes;
+        params1.enhancements.internalScaleM1 = scale - 1u;
 
         vdp2.cpuCommonRenderParams.enhancements = params1.enhancements;
     }
@@ -2216,6 +2334,24 @@ struct Direct3D12VDPRenderer::Impl {
         static constexpr size_t kFrameSize = kVDP1FBRAMSize * 2;
 
         ID3D12Resource *dstResource = vdp1.fbramBuffer.GetPointer();
+
+        if (scale > 1) {
+            // Scaled framebuffers: clear everything, then replay the CPU-visible framebuffer as FBRAM writes so that
+            // the write shader expands every pixel into its scaled block.
+            barrierTracker.TransitionBuffer(dstResource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+            barrierTracker.Flush(cmdList);
+            // This may run before the command list is fully set up (renderer initialization)
+            ID3D12DescriptorHeap *heaps[] = {resourceHeap.GetPointer()};
+            cmdList->SetDescriptorHeaps(std::size(heaps), heaps);
+            static constexpr UINT kClearValue[4] = {0, 0, 0, 0};
+            cmdList->ClearUnorderedAccessViewUint(vdp1.fbramWriteDescs.GetGPUHandle(1), vdp1.fbramUAV.cpuHandle,
+                                                  dstResource, kClearValue, 0, nullptr);
+            barrierTracker.UAVBuffer(dstResource);
+            vdp1.fbramDirty.SetAll();
+            vdp1.fbramReadbackDirty = true;
+            return {};
+        }
         ID3D12Resource *uploadBufferPtr = uploadBuffer.GetBufferResource().GetPointer();
 
         // Transition to copy
@@ -2391,8 +2527,8 @@ struct Direct3D12VDPRenderer::Impl {
 
         // Do framebuffer erase
         const auto &erase = vdp1.cpuEraseParams;
-        const uint32 width = (erase.coords.x3 << 3) - (erase.coords.x1 << 3) + 1;
-        const uint32 height = erase.coords.y3 - erase.coords.y1 + 1;
+        const uint32 width = ((erase.coords.x3 << 3) - (erase.coords.x1 << 3) + 1) * scale;
+        const uint32 height = (erase.coords.y3 - erase.coords.y1 + 2) * scale;
 
         FrameContext &frameCtx = frames.GetCurrentFrame();
 
@@ -2425,6 +2561,69 @@ struct Direct3D12VDPRenderer::Impl {
         VDP1CopyFBRAMToReadback();
     }
 
+    /// @brief Downsamples both scaled framebuffers into the native FBRAM buffer at the current scale.
+    void VDP1DownsampleFBRAM() {
+        barrierTracker.TransitionBuffer(vdp1.fbramBuffer.GetPointer(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        barrierTracker.TransitionBuffer(vdp1.fbramNativeBuffer.GetPointer(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        barrierTracker.Flush(cmdList);
+
+        const uint32 wordCount = kVDP1FBRAMSize * 2 / sizeof(uint32);
+        cmdList->SetPipelineState(vdp1.fbramDownsamplePSO.GetPointer());
+        cmdList->SetComputeRootSignature(vdp1.fbramDownsampleRootSig.GetPointer());
+        cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp1.cpuCommonRenderParams) / sizeof(uint32),
+                                              &vdp1.cpuCommonRenderParams, 0);
+        cmdList->SetComputeRootDescriptorTable(1, vdp1.fbramDownsampleDescs.GetGPUHandle());
+        cmdList->Dispatch((wordCount + 63) / 64, 1, 1);
+    }
+
+    /// @brief Changes the internal resolution scale, converting the VDP1 framebuffers to the new scale.
+    /// Must be called between frames (VDP2 frame start), with no VDP1 work pending.
+    void ChangeScale(uint32 newScale) {
+        if (newScale == scale || maxScale == 1) {
+            return;
+        }
+        VDP1FlushWork();
+        if (auto result = VDP1FlushFBRAM(); !result) {
+            devlog::warn<grp::dx12_vdp1>("VDP1 FBRAM flush failed: {}", result.Error().message);
+        }
+
+        // Scaled framebuffers -> native FBRAM (at the old scale)
+        VDP1DownsampleFBRAM();
+
+        scale = newScale;
+        vdp1.cpuCommonRenderParams.enhancements.internalScaleM1 = scale - 1u;
+        vdp2.cpuCommonRenderParams.enhancements.internalScaleM1 = scale - 1u;
+        config::hwCurrentScale = scale;
+
+        // Clear everything (alternate field and mesh buffers start empty), then native FBRAM -> scaled framebuffers
+        ID3D12Resource *fbram = vdp1.fbramBuffer.GetPointer();
+        barrierTracker.TransitionBuffer(fbram, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        barrierTracker.TransitionBuffer(vdp1.fbramNativeBuffer.GetPointer(),
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+        barrierTracker.Flush(cmdList);
+        static constexpr UINT kClearValue[4] = {0, 0, 0, 0};
+        cmdList->ClearUnorderedAccessViewUint(vdp1.fbramWriteDescs.GetGPUHandle(1), vdp1.fbramUAV.cpuHandle, fbram,
+                                              kClearValue, 0, nullptr);
+        barrierTracker.UAVBuffer(fbram);
+        barrierTracker.Flush(cmdList);
+
+        const uint32 wordCount = kVDP1FBRAMSize * 2 / sizeof(uint32);
+        cmdList->SetPipelineState(vdp1.fbramUpsamplePSO.GetPointer());
+        cmdList->SetComputeRootSignature(vdp1.fbramDownsampleRootSig.GetPointer());
+        cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp1.cpuCommonRenderParams) / sizeof(uint32),
+                                              &vdp1.cpuCommonRenderParams, 0);
+        cmdList->SetComputeRootDescriptorTable(1, vdp1.fbramUpsampleDescs.GetGPUHandle());
+        cmdList->Dispatch((wordCount + 63) / 64, 1, 1);
+        barrierTracker.UAVBuffer(fbram);
+
+        vdp1.fbramReadbackDirty = true;
+        devlog::info<grp::dx12_base>("Internal resolution scale changed to {}x", scale);
+    }
+
     /// @brief Copies GPU-modified FBRAM to the readback buffer.
     void VDP1CopyFBRAMToReadback() {
         if (!vdp1.fbramReadbackDirty) {
@@ -2432,6 +2631,18 @@ struct Direct3D12VDPRenderer::Impl {
         }
         vdp1.fbramReadbackDirty = false;
         vdp1.fbramReadbackCopyPending = true;
+
+        if (scale > 1) {
+            // Downsample the scaled framebuffers into native FBRAM, then download that
+            VDP1DownsampleFBRAM();
+
+            barrierTracker.TransitionBuffer(vdp1.fbramNativeBuffer.GetPointer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                            D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE);
+            barrierTracker.Flush(cmdList);
+            cmdList->CopyBufferRegion(vdp1.fbramDownloadBuffer.GetPointer(), 0, vdp1.fbramNativeBuffer.GetPointer(), 0,
+                                      kVDP1FBRAMSize * 2);
+            return;
+        }
 
         // Download FBRAM
         barrierTracker.TransitionBuffer(vdp1.fbramBuffer.GetPointer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -2644,8 +2855,8 @@ struct Direct3D12VDPRenderer::Impl {
             const VDP1Regs &regs1 = vdpState.regs1;
             const VDP2Regs &regs2 = vdpState.regs2;
             const uint32 pixelsPerEntry = regs1.tvmr.pixel8Bits ? 4u : 2u; // each entry is 32 bits
-            const uint32 mergeW = regs1.tvmr.fbSizeH / pixelsPerEntry;
-            const uint32 mergeH = regs1.tvmr.fbSizeV;
+            const uint32 mergeW = regs1.tvmr.fbSizeH * scale / pixelsPerEntry;
+            const uint32 mergeH = regs1.tvmr.fbSizeV * scale;
             const uint32 mergeZ = regs2.TVMD.IsInterlaced() && enhancements.deinterlace ? 2 : 1;
 
             // Dispatch output merger shader
@@ -2730,12 +2941,14 @@ struct Direct3D12VDPRenderer::Impl {
         if (coord0.y() < 0 && coord1.y() < 0) {
             return false;
         }
-        const sint32 sysClipH = vdpState.state1.sysClipH;
+        // Coordinates are scaled by the internal resolution; so is the clipping area (inclusive)
+        const sint32 iscale = static_cast<sint32>(scale);
+        const sint32 sysClipH = vdpState.state1.sysClipH * iscale + (iscale - 1);
         if (coord0.x() > sysClipH && coord1.x() > sysClipH) {
             return false;
         }
         const sint32 doubleV = vdp1.doubleV ? 1 : 0;
-        const sint32 sysClipV = (vdpState.state1.sysClipV << doubleV) | doubleV;
+        const sint32 sysClipV = ((vdpState.state1.sysClipV << doubleV) | doubleV) * iscale + (iscale - 1);
         if (coord0.y() > sysClipV && coord1.y() > sysClipV) {
             return false;
         }
@@ -2746,9 +2959,18 @@ struct Direct3D12VDPRenderer::Impl {
         }
 
         // Determine span length
-        LineStepper line{coord0, coord1};
-        const uint32 skip = line.SystemClip(sysClipH, sysClipV);
-        const uint32 length = line.Length();
+        // Scaled coordinates need wider counters than the hardware's 13 bits
+        uint32 skip;
+        uint32 length;
+        if (scale == 1) {
+            LineStepper<13> line{coord0, coord1};
+            skip = line.SystemClip(sysClipH, sysClipV);
+            length = line.Length();
+        } else {
+            LineStepper<kScaledStepperBits> line{coord0, coord1};
+            skip = line.SystemClip(sysClipH, sysClipV);
+            length = line.Length();
+        }
 
         if (length == 0) {
             // Entire line was clipped
@@ -2817,9 +3039,64 @@ struct Direct3D12VDPRenderer::Impl {
         return true;
     }
 
+    // -----------------------------------------------------------------------------------------------------------------
+    // Internal resolution scaling of VDP1 vertices
+
+    /// @brief Scales the vertices of a rectangle so that each native pixel covers a `scale` x `scale` block.
+    /// The vertices must be in rectangle order: A top-left, B top-right, C bottom-right, D bottom-left (sides may be
+    /// flipped). The right and bottom sides are extended to the end of their blocks so that adjacent rectangles meet.
+    void VDP1ScaleRect(CoordS32 &a, CoordS32 &b, CoordS32 &c, CoordS32 &d) const {
+        if (scale == 1) {
+            return;
+        }
+        const sint32 s = static_cast<sint32>(scale);
+        auto scaleCoord = [s](sint32 value, bool farSide) { return value * s + (farSide ? s - 1 : 0); };
+        const bool bRight = a.x() <= b.x();
+        const bool cRight = d.x() <= c.x();
+        const bool dBelow = a.y() <= d.y();
+        const bool cBelow = b.y() <= c.y();
+        a = CoordS32{scaleCoord(a.x(), !bRight), scaleCoord(a.y(), !dBelow)};
+        b = CoordS32{scaleCoord(b.x(), bRight), scaleCoord(b.y(), !cBelow)};
+        c = CoordS32{scaleCoord(c.x(), cRight), scaleCoord(c.y(), cBelow)};
+        d = CoordS32{scaleCoord(d.x(), !cRight), scaleCoord(d.y(), dBelow)};
+    }
+
+    /// @brief Scales a vertex of an arbitrary shape to the center of its `scale` x `scale` block.
+    /// Vertices shared between adjacent polygons map to the same point, so meshes stay closed.
+    CoordS32 VDP1ScalePoint(CoordS32 p) const {
+        if (scale == 1) {
+            return p;
+        }
+        const sint32 s = static_cast<sint32>(scale);
+        const sint32 half = (s - 1) / 2;
+        return CoordS32{p.x() * s + half, p.y() * s + half};
+    }
+
+    /// @brief Scales the vertices of a quad: rectangles use `VDP1ScaleRect`, other shapes `VDP1ScalePoint`.
+    void VDP1ScaleQuad(CoordS32 &a, CoordS32 &b, CoordS32 &c, CoordS32 &d, bool isRegularRect) const {
+        if (isRegularRect) {
+            VDP1ScaleRect(a, b, c, d);
+        } else {
+            a = VDP1ScalePoint(a);
+            b = VDP1ScalePoint(b);
+            c = VDP1ScalePoint(c);
+            d = VDP1ScalePoint(d);
+        }
+    }
+
     void VDP1PlotTexturedQuad(VDP1SpanData &data, uint32 cmdAddress, VDP1Command::Control control, CoordS32 coordA,
                               CoordS32 coordB, CoordS32 coordC, CoordS32 coordD) {
-        QuadStepper quad{coordA, coordB, coordC, coordD};
+        if (scale == 1) {
+            VDP1PlotTexturedQuadT<13>(data, cmdAddress, control, coordA, coordB, coordC, coordD);
+        } else {
+            VDP1PlotTexturedQuadT<kScaledStepperBits>(data, cmdAddress, control, coordA, coordB, coordC, coordD);
+        }
+    }
+
+    template <sint32 t_bits>
+    void VDP1PlotTexturedQuadT(VDP1SpanData &data, uint32 cmdAddress, VDP1Command::Control control, CoordS32 coordA,
+                               CoordS32 coordB, CoordS32 coordC, CoordS32 coordD) {
+        QuadStepper<t_bits> quad{coordA, coordB, coordC, coordD};
 
         if (data.mode.gouraudEnable) {
             const uint32 gouraudTable = static_cast<uint32>(vdpState.mem1.ReadVRAM<uint16>(cmdAddress + 0x1C)) << 3u;
@@ -3006,10 +3283,11 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 doubleV = vdp1.doubleV ? 1 : 0;
         const sint32 yAdd = enhancements.deinterlace ? doubleV : 0;
 
-        const CoordS32 coordA{xa, ya << doubleV};
-        const CoordS32 coordB{xb, ya << doubleV};
-        const CoordS32 coordC{xb, (yb << doubleV) + yAdd};
-        const CoordS32 coordD{xa, (yb << doubleV) + yAdd};
+        CoordS32 coordA{xa, ya << doubleV};
+        CoordS32 coordB{xb, ya << doubleV};
+        CoordS32 coordC{xb, (yb << doubleV) + yAdd};
+        CoordS32 coordD{xa, (yb << doubleV) + yAdd};
+        VDP1ScaleRect(coordA, coordB, coordC, coordD);
 
         const VDP1CommandData cmdData{
             .mode = mode,
@@ -3121,10 +3399,11 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 doubleV = vdp1.doubleV ? 1 : 0;
         const sint32 yAdd = enhancements.deinterlace ? doubleV : 0;
 
-        const CoordS32 coordA{qxa, qya << doubleV};
-        const CoordS32 coordB{qxb, qyb << doubleV};
-        const CoordS32 coordC{qxc, (qyc << doubleV) + yAdd};
-        const CoordS32 coordD{qxd, (qyd << doubleV) + yAdd};
+        CoordS32 coordA{qxa, qya << doubleV};
+        CoordS32 coordB{qxb, qyb << doubleV};
+        CoordS32 coordC{qxc, (qyc << doubleV) + yAdd};
+        CoordS32 coordD{qxd, (qyd << doubleV) + yAdd};
+        VDP1ScaleRect(coordA, coordB, coordC, coordD);
 
         const VDP1CommandData cmdData{
             .mode = mode,
@@ -3171,10 +3450,11 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 yAddAB = enhancements.deinterlace && isRegularRect && (ya >= yc) ? doubleV : 0;
         const sint32 yAddCD = enhancements.deinterlace && isRegularRect && (ya < yc) ? doubleV : 0;
 
-        const CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
-        const CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
-        const CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
-        const CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
+        CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
+        CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
+        CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        VDP1ScaleQuad(coordA, coordB, coordC, coordD, isRegularRect);
 
         const VDP1CommandData cmdData{
             .mode = mode,
@@ -3220,10 +3500,11 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 yAddAB = enhancements.deinterlace && isRegularRect && (ya >= yc) ? doubleV : 0;
         const sint32 yAddCD = enhancements.deinterlace && isRegularRect && (ya < yc) ? doubleV : 0;
 
-        const CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
-        const CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
-        const CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
-        const CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
+        CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
+        CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
+        CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        VDP1ScaleQuad(coordA, coordB, coordC, coordD, isRegularRect);
 
         Color555 gouraudA;
         Color555 gouraudB;
@@ -3247,59 +3528,67 @@ struct Direct3D12VDPRenderer::Impl {
             .mode = mode,
         };
 
-        QuadStepper quad{coordA, coordB, coordC, coordD};
-
-        if (mode.gouraudEnable) {
-            quad.SetupGouraud(gouraudA, gouraudB, gouraudC, gouraudD);
-        }
-
-        // Optimization for the case where the quad goes outside the system clipping area.
-        // Skip rendering the rest of the quad when a line is clipped after plotting at least one line.
-        // The first few lines of the quad could also be clipped; that is accounted for by requiring at least one
-        // plotted line. The point is to skip the calculations once the quad iterator reaches a point where no more
-        // lines can be plotted because they all sit outside the system clip area.
-        //
-        // This also handles a degenerate case with a bowtie quad sitting outside the corner of the screen with two
-        // points poking into the screen area in a configuration similar to this:
-        //
-        //                       D
-        //                        B
-        //   +-----------------+
-        //   |            A    |
-        //   |               C |
-        //   |                 |
-        //   |                 |
-        //   |                 |
-        //   +-----------------+
-        //
-        // In this case, the line gets fully clipped partway through the quad, but comes back into view at the end, so
-        // we need to check for two sequences of plotted lines rather than one.
-        bool linePlotted = false;
-        int plottedSegmentsCount = 0;
-        const int plottedSegmentsMax = quad.IsDegenerate() ? 2 : 1;
-
-        // Interpolate linearly over edges A-D and B-C
-        for (; quad.CanStep(); quad.Step()) {
-            // Plot lines between the interpolated points
-            const CoordS32 coordL = quad.LeftEdge().Coord();
-            const CoordS32 coordR = quad.RightEdge().Coord();
+        // Scaled coordinates need wider counters than the hardware's 13 bits
+        auto plotQuad = [&]<sint32 t_bits>() {
+            QuadStepper<t_bits> quad{coordA, coordB, coordC, coordD};
 
             if (mode.gouraudEnable) {
-                spanData.gouraud0 = quad.LeftEdge().GouraudValue();
-                spanData.gouraud1 = quad.RightEdge().GouraudValue();
+                quad.SetupGouraud(gouraudA, gouraudB, gouraudC, gouraudD);
             }
 
-            if (VDP1AddSpan(coordL, coordR, spanData, false, true)) {
-                if (!linePlotted) {
-                    linePlotted = true;
-                    ++plottedSegmentsCount;
+            // Optimization for the case where the quad goes outside the system clipping area.
+            // Skip rendering the rest of the quad when a line is clipped after plotting at least one line.
+            // The first few lines of the quad could also be clipped; that is accounted for by requiring at least one
+            // plotted line. The point is to skip the calculations once the quad iterator reaches a point where no more
+            // lines can be plotted because they all sit outside the system clip area.
+            //
+            // This also handles a degenerate case with a bowtie quad sitting outside the corner of the screen with two
+            // points poking into the screen area in a configuration similar to this:
+            //
+            //                       D
+            //                        B
+            //   +-----------------+
+            //   |            A    |
+            //   |               C |
+            //   |                 |
+            //   |                 |
+            //   |                 |
+            //   +-----------------+
+            //
+            // In this case, the line gets fully clipped partway through the quad, but comes back into view at the end, so
+            // we need to check for two sequences of plotted lines rather than one.
+            bool linePlotted = false;
+            int plottedSegmentsCount = 0;
+            const int plottedSegmentsMax = quad.IsDegenerate() ? 2 : 1;
+
+            // Interpolate linearly over edges A-D and B-C
+            for (; quad.CanStep(); quad.Step()) {
+                // Plot lines between the interpolated points
+                const CoordS32 coordL = quad.LeftEdge().Coord();
+                const CoordS32 coordR = quad.RightEdge().Coord();
+
+                if (mode.gouraudEnable) {
+                    spanData.gouraud0 = quad.LeftEdge().GouraudValue();
+                    spanData.gouraud1 = quad.RightEdge().GouraudValue();
                 }
-            } else if (plottedSegmentsCount >= plottedSegmentsMax) {
-                // No more lines can be drawn past this point
-                break;
-            } else {
-                linePlotted = false;
+
+                if (VDP1AddSpan(coordL, coordR, spanData, false, true)) {
+                    if (!linePlotted) {
+                        linePlotted = true;
+                        ++plottedSegmentsCount;
+                    }
+                } else if (plottedSegmentsCount >= plottedSegmentsMax) {
+                    // No more lines can be drawn past this point
+                    break;
+                } else {
+                    linePlotted = false;
+                }
             }
+        };
+        if (scale == 1) {
+            plotQuad.template operator()<13>();
+        } else {
+            plotQuad.template operator()<kScaledStepperBits>();
         }
     }
 
@@ -3328,10 +3617,11 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 yAddAB = enhancements.deinterlace && isRegularRect && (ya >= yc) ? doubleV : 0;
         const sint32 yAddCD = enhancements.deinterlace && isRegularRect && (ya < yc) ? doubleV : 0;
 
-        const CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
-        const CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
-        const CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
-        const CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        CoordS32 coordA{xa, (ya << doubleV) + yAddAB};
+        CoordS32 coordB{xb, (yb << doubleV) + yAddAB};
+        CoordS32 coordC{xc, (yc << doubleV) + yAddCD};
+        CoordS32 coordD{xd, (yd << doubleV) + yAddCD};
+        VDP1ScaleQuad(coordA, coordB, coordC, coordD, isRegularRect);
 
         Color555 gouraudA;
         Color555 gouraudB;
@@ -3391,8 +3681,8 @@ struct Direct3D12VDPRenderer::Impl {
         const sint32 xb = bit::sign_extend<13>(vdpState.mem1.ReadVRAM<uint16>(cmdAddress + 0x10)) + state.localCoordX;
         const sint32 yb = bit::sign_extend<13>(vdpState.mem1.ReadVRAM<uint16>(cmdAddress + 0x12)) + state.localCoordY;
 
-        const CoordS32 coordA{xa, ya};
-        const CoordS32 coordB{xb, yb};
+        const CoordS32 coordA = VDP1ScalePoint(CoordS32{xa, ya});
+        const CoordS32 coordB = VDP1ScalePoint(CoordS32{xb, yb});
 
         const VDP1CommandData cmdData{
             .mode = mode,
@@ -4268,6 +4558,21 @@ struct Direct3D12VDPRenderer::Impl {
     }
 
     void VDP2BeginFrame() {
+        // Apply a requested internal resolution change (dynamic resolution) between frames
+        if (maxScale > 1) {
+            const uint32 requested = config::hwRequestedScale.load(std::memory_order_relaxed);
+            uint32 target = requested == 0 ? maxScale : std::clamp(requested, 1u, maxScale);
+            // Constant output resolution: screens the Saturn already draws at high resolution (640/704 pixels wide or
+            // 448+ lines) use half the factor, so they come out as sharp as low resolution screens at the full factor
+            // for the same cost. E.g. at 4x: 352x224 -> 1408x896 and 704x448 -> 1408x896.
+            if (HRes > kMaxNormalResH || VRes > kMaxNormalResV) {
+                target = std::max(1u, (target + 1u) / 2u);
+            }
+            if (target != scale) {
+                ChangeScale(target);
+            }
+        }
+
         vdp2.nextLayerRenderLine = 0;
         vdp2.nextComposeLine = 0;
 
@@ -4359,7 +4664,7 @@ struct Direct3D12VDPRenderer::Impl {
         cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp2.cpuCommonRenderParams) / sizeof(uint32),
                                               &vdp2.cpuCommonRenderParams, 0);
         cmdList->SetComputeRootDescriptorTable(1, frameCtx.drawSpriteDescs.GetGPUHandle());
-        cmdList->Dispatch((HRes + 31) / 32, numLines, enhancements.transparentMeshes ? 2 : 1);
+        cmdList->Dispatch((HRes * scale + 31) / 32, numLines * scale, enhancements.transparentMeshes ? 2 : 1);
 
         // ---------------------------------------------------------------------
 
@@ -4439,7 +4744,7 @@ struct Direct3D12VDPRenderer::Impl {
         cmdList->SetComputeRoot32BitConstants(0, sizeof(vdp2.cpuCommonRenderParams) / sizeof(uint32),
                                               &vdp2.cpuCommonRenderParams, 0);
         cmdList->SetComputeRootDescriptorTable(1, frameCtx.composeDescs.GetGPUHandle());
-        cmdList->Dispatch((HRes + 31) / 32, numLines, 1);
+        cmdList->Dispatch((HRes * scale + 31) / 32, numLines * scale, 1);
     }
 
     void VDP2RenderLine(uint32 y) {
@@ -4481,7 +4786,8 @@ struct Direct3D12VDPRenderer::Impl {
         // Request a frame from the frontend
         // TODO: consider adding support for GPU waits
         ID3D12Resource *copyTarget =
-            hwCallbacks.FrameCopyRequest(computeFence.GetPointer(), frames.GetNextFenceValue(), HRes, VRes);
+            hwCallbacks.FrameCopyRequest(computeFence.GetPointer(), frames.GetNextFenceValue(), HRes * scale, VRes * scale,
+                                         scale);
         if (copyTarget != nullptr) {
             // Transition composited output texture to copy source
             barrierTracker.TransitionTexture(vdp2.compositeOutTexture.GetPointer(), D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -4509,8 +4815,8 @@ struct Direct3D12VDPRenderer::Impl {
                     .left = 0,
                     .top = 0,
                     .front = 0,
-                    .right = HRes,
-                    .bottom = VRes,
+                    .right = HRes * scale,
+                    .bottom = VRes * scale,
                     .back = 1,
                 };
                 cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);

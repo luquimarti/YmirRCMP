@@ -241,6 +241,9 @@ struct DisplayTextureSpec {
 
     /// @brief The height of the display contained in the texture.
     uint32 height;
+
+    /// @brief The internal resolution scale included in the width and height (hardware renderers).
+    uint32 scale = 1;
 };
 
 } // namespace app::gfx

@@ -73,7 +73,8 @@ public:
     /// @param[in] width the display width
     /// @param[in] height the display height
     /// @return a pointer to the next free display output frame, or `nullptr` if no frame is available
-    ID3D12Resource *GetNextDisplayOutputTexture(ID3D12Fence *fence, uint64 fenceValue, uint32 width, uint32 height);
+    ID3D12Resource *GetNextDisplayOutputTexture(ID3D12Fence *fence, uint64 fenceValue, uint32 width, uint32 height,
+                                                uint32 scale);
 
 private:
     std::unique_ptr<Impl> m_impl;

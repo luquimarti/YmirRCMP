@@ -502,6 +502,10 @@ struct Settings {
         struct Enhancements {
             util::Observable<bool> deinterlace;
             util::Observable<bool> transparentMeshes;
+            /// Internal resolution scale of the hardware renderer (1-4). Applied on the next start.
+            uint32 internalResolution = 1;
+            /// Lower the internal resolution automatically when emulation can't keep full speed.
+            bool dynamicResolution = false;
         } enhancements;
     } video;
 

@@ -13,15 +13,21 @@
 #include <ymir_recomp/runtime.hpp>
 
 #include <ymir/core/hash.hpp>
+#include <ymir/hw/vdp/vdp_configs.hpp>
 #include <ymir/db/ipl_db.hpp>
 #include <ymir/sys/memory_defs.hpp>
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_misc.h>
+#include <SDL3/SDL_surface.h>
+#include <SDL3/SDL_video.h>
+#include <stb_image.h>
 #include <imgui.h>
 
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -62,6 +68,8 @@ namespace {
         bool resumeOnClose = false;
         bool advanced = false;
         bool controlsFromMenu = false;
+        bool confirmRestart = false;
+        bool aboutOpen = false;
     };
 
     State g_state;
@@ -86,6 +94,18 @@ namespace {
         quit.type = SDL_EVENT_QUIT;
         SDL_PushEvent(&quit);
     }
+
+    // Support link shown in the menus
+    constexpr const char *kSupportLabel = "Support Saturn Recomp";
+    constexpr const char *kSupportURL = "https://www.patreon.com/cw/luquimarti";
+
+    void OpenSupportPage() {
+        SDL_OpenURL(kSupportURL);
+    }
+
+    constexpr const char *kDrydockURL = "https://github.com/luquimarti/Drydock";
+    constexpr const char *kShipsURLBase = "https://github.com/luquimarti/";
+    constexpr const char *kYmirURL = "https://github.com/StrikerX3/Ymir";
 
     // -------------------------------------------------------------------------
     // BIOS
@@ -475,6 +495,11 @@ namespace {
         ImGui::Spacing();
         PushFont(false, d->fontSizes.small);
         ImGui::TextColored(kFaint, "This program contains no game data. Built with Drydock on the Ymir emulator.");
+        ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+        if (ImGui::Selectable(kSupportLabel, false, ImGuiSelectableFlags_None, ImGui::CalcTextSize(kSupportLabel))) {
+            OpenSupportPage();
+        }
+        ImGui::PopStyleColor();
         ImGui::PopFont();
         EndScreen();
     }
@@ -482,6 +507,8 @@ namespace {
     void CloseMenu() {
         State &s = g_state;
         s.menuOpen = false;
+        s.confirmRestart = false;
+        s.aboutOpen = false;
         s.controlsFromMenu = false;
         if (s.resumeOnClose) s.host.context->EnqueueEvent(events::emu::SetPaused(false));
         s.resumeOnClose = false;
@@ -503,8 +530,78 @@ namespace {
         ImGui::PopFont();
     }
 
+    void LinkButton(const char *label, const std::string &url) {
+        if (ImGui::Button(label)) {
+            SDL_OpenURL(url.c_str());
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", url.c_str());
+        }
+    }
+
+    void DrawAbout() {
+        State &s = g_state;
+        const YmirImGuiData *d = GetYmirImGuiData();
+        if (!BeginScreen("##drydock_about", ImVec4(0.02f, 0.02f, 0.03f, 0.90f), 620.0f)) return;
+
+        const std::string &ship = s.recipe.ship;
+        const std::string &game = s.recipe.title;
+        Header("About " + ship);
+        PushFont(false, d->fontSizes.large);
+        ImGui::TextWrapped("%s is a native PC version of %s, built with Drydock.", ship.c_str(), game.c_str());
+        ImGui::Spacing();
+        ImGui::TextWrapped("Every game Drydock can rebuild is a ship: a recipe that describes where the game's code "
+                           "lives and how to rebuild it. %s is the first one to leave the dock.",
+                           ship.c_str());
+        ImGui::Spacing();
+        ImGui::TextWrapped("Drydock's static recompilation is made with the help of AI. Studying each game's code and "
+                           "turning it into a working recompilation takes a lot of AI work, and every new ship needs "
+                           "more of it. If you'd like to see more ships set sail, you can support the project on "
+                           "Patreon: it pays for those tokens and for the time it takes to polish each one. Thank you!");
+        ImGui::Spacing();
+
+        if (s.menuFocus) {
+            ImGui::SetKeyboardFocusHere();
+            s.menuFocus = false;
+        }
+        if (PrimaryButton("Support on Patreon")) OpenSupportPage();
+        ImGui::SameLine();
+        LinkButton("Drydock", kDrydockURL);
+        ImGui::SameLine();
+        LinkButton(ship.c_str(), kShipsURLBase + ship);
+        ImGui::SameLine();
+        LinkButton("Ymir", kYmirURL);
+        ImGui::PopFont();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        PushFont(false, d->fontSizes.medium);
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextWrapped("The first time you launch it, Drydock reads the game's program code from your own disc and "
+                           "recompiles it: the instructions written for the Saturn's SH-2 processors are translated into "
+                           "C++ and compiled into native code for your PC. The rest of the console (graphics, sound, "
+                           "the CD drive) is emulated by Ymir, a Sega Saturn emulator by StrikerX3 and contributors. "
+                           "Nothing from the game is included in this download; it all comes from your disc.");
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+
+        ImGui::Spacing();
+        PushFont(false, d->fontSizes.large);
+        if (ImGui::Button("Close", ImVec2(-FLT_MIN, 0))) {
+            s.aboutOpen = false;
+            s.menuFocus = true;
+        }
+        ImGui::PopFont();
+        EndScreen();
+    }
+
     void DrawMenu() {
         State &s = g_state;
+        if (s.aboutOpen) {
+            DrawAbout();
+            return;
+        }
         Settings &settings = *s.host.settings;
         const YmirImGuiData *d = GetYmirImGuiData();
         if (!BeginScreen("##drydock_menu", ImVec4(0.02f, 0.02f, 0.03f, 0.82f), 540.0f)) return;
@@ -544,6 +641,34 @@ namespace {
         settings.MakeDirty(ImGui::Checkbox("Show frame rate", &settings.gui.showFrameRateOSD));
 
         SectionTitle("Graphics");
+        {
+            // Internal resolution (hardware renderer). Up to the size allocated at start it applies right away;
+            // going higher needs a restart.
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Resolution");
+            uint32 &res = settings.video.enhancements.internalResolution;
+            static const char *kLabels[] = {"1x (original)", "2x", "3x", "4x"};
+            for (uint32 i = 1; i <= 4; ++i) {
+                ImGui::SameLine();
+                if (ImGui::RadioButton(kLabels[i - 1], res == i)) {
+                    res = i;
+                    settings.MakeDirty();
+                }
+            }
+            settings.MakeDirty(ImGui::Checkbox("Lower automatically to keep full speed",
+                                               &settings.video.enhancements.dynamicResolution));
+            const uint32 allocated = ymir::vdp::config::GetHWInternalScale();
+            const uint32 current = ymir::vdp::config::hwCurrentScale.load(std::memory_order_relaxed);
+            PushFont(false, d->fontSizes.medium);
+            if (!settings.video.useHardwareAcceleration) {
+                ImGui::TextColored(kDim, "Needs video by GPU (Advanced > Video).");
+            } else if (res > allocated) {
+                ImGui::TextColored(d->colors.notice, "Restart %s to apply.", s.recipe.title.c_str());
+            } else if (allocated > 1) {
+                ImGui::TextColored(kDim, "Now rendering at %ux.", current);
+            }
+            ImGui::PopFont();
+        }
         bool transparent = settings.video.enhancements.transparentMeshes.Get();
         if (ImGui::Checkbox("Real transparency (experimental)", &transparent)) {
             settings.video.enhancements.transparentMeshes = transparent;
@@ -579,9 +704,34 @@ namespace {
             s.controlsFromMenu = true;
             s.host.openSettings(ui::SettingsTab::Input);
         }
-        if (ImGui::Button(s.advanced ? "Hide emulator menus" : "Advanced: all emulator menus and settings", wide)) {
-            s.advanced = !s.advanced;
-            close = true;
+        if (ImGui::Button("Advanced settings...", wide)) {
+            s.menuOpen = false; // stays paused; the menu comes back when the window is closed
+            s.controlsFromMenu = true;
+            s.host.openSettings(ui::SettingsTab::General);
+        }
+        PushFont(false, d->fontSizes.medium);
+        ImGui::Checkbox("Show the emulator's menu bar", &s.advanced);
+        ImGui::PopFont();
+        if (s.confirmRestart) {
+            PushFont(false, d->fontSizes.medium);
+            ImGui::TextColored(d->colors.notice, "Restart %s? Progress since your last save will be lost.",
+                               s.recipe.title.c_str());
+            ImGui::PopFont();
+            if (PrimaryButton("Yes, restart")) {
+                s.confirmRestart = false;
+                s.host.context->EnqueueEvent(events::emu::HardReset());
+                close = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                s.confirmRestart = false;
+            }
+        } else if (ImGui::Button("Restart game", wide)) {
+            s.confirmRestart = true;
+        }
+        if (ImGui::Button(("About " + s.recipe.ship).c_str(), wide)) {
+            s.aboutOpen = true;
+            s.menuFocus = true;
         }
         if (ImGui::Button("Quit", wide)) Quit();
         ImGui::PopFont();
@@ -589,8 +739,8 @@ namespace {
         ImGui::Spacing();
         PushFont(false, d->fontSizes.small);
         ImGui::TextColored(kFaint, "%s",
-                           s.advanced ? "Esc or the controller's Guide button opens this menu. Emulator menus: top "
-                                        "of the window."
+                           s.advanced ? "Esc or the controller's Guide button opens this menu. The emulator's menu "
+                                        "bar is at the top of the window."
                                       : "Esc or the controller's Guide button opens this menu.");
         ImGui::PopFont();
         EndScreen();
@@ -620,6 +770,33 @@ bool Init(const Host &host, const fs::path &exeDir) {
     return true;
 }
 
+void ApplyWindowIcon(SDL_Window *window) {
+    State &s = g_state;
+    if (s.phase == Phase::Off || window == nullptr) {
+        return;
+    }
+    // Read through std::filesystem so that non-ASCII install paths work on Windows
+    std::vector<char> file;
+    {
+        std::ifstream in(s.exeDir / "ship" / "icon.png", std::ios::binary);
+        if (!in) {
+            return;
+        }
+        file.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    int w = 0, h = 0, channels = 0;
+    stbi_uc *pixels = stbi_load_from_memory(reinterpret_cast<const stbi_uc *>(file.data()),
+                                            static_cast<int>(file.size()), &w, &h, &channels, 4);
+    if (pixels == nullptr) {
+        return;
+    }
+    if (SDL_Surface *surface = SDL_CreateSurfaceFrom(w, h, SDL_PIXELFORMAT_RGBA32, pixels, w * 4)) {
+        SDL_SetWindowIcon(window, surface);
+        SDL_DestroySurface(surface);
+    }
+    stbi_image_free(pixels);
+}
+
 bool Enabled() {
     return g_state.phase != Phase::Off;
 }
@@ -643,8 +820,14 @@ bool OnMenuButton() {
     State &s = g_state;
     if (s.phase == Phase::Off) return false;
     if (s.phase != Phase::Ready) return true; // the setup screens have their own buttons
-    if (s.menuOpen) CloseMenu();
-    else OpenMenu();
+    if (s.aboutOpen) {
+        s.aboutOpen = false; // back to the menu
+        s.menuFocus = true;
+    } else if (s.menuOpen) {
+        CloseMenu();
+    } else {
+        OpenMenu();
+    }
     return true;
 }
 

@@ -16,6 +16,7 @@
 
 #include <ymir/gpu/shaders/gpu_shaders.hpp>
 
+#include <ymir/hw/vdp/vdp_configs.hpp>
 #include <ymir/hw/vdp/vdp_defs.hpp>
 
 #include <ymir/util/string.hpp>
@@ -206,6 +207,7 @@ struct Direct3D12GraphicsContext::Impl {
 
         uint32 width;
         uint32 height;
+        uint32 scale = 1; // internal resolution scale included in width and height
 
         std::atomic<ID3D12Fence *> computeFence; // Compute fence to be waited on
         std::atomic<UINT64> computeFenceValue;   // Value to wait for
@@ -380,9 +382,11 @@ struct Direct3D12GraphicsContext::Impl {
             DisplayFrameContext &frameCtx = displayFrames[n];
 
             // Create the hardware texture
+            // Sized for the hardware renderer's internal resolution scale
+            const uint32 hwScale = ymir::vdp::config::GetHWInternalScale();
             const Texture2DSpec spec{
-                .width = ymir::vdp::kMaxResH,
-                .height = ymir::vdp::kMaxResV,
+                .width = ymir::vdp::kMaxResH * hwScale,
+                .height = ymir::vdp::kMaxResV * hwScale,
                 .format = PixelFormat::R8G8B8A8_UNORM,
                 .access = TextureAccess::Static,
                 .filterMode = TextureFilterMode::Nearest,
@@ -1610,7 +1614,8 @@ struct Direct3D12GraphicsContext::Impl {
         return computeDisplayFrame;
     }
 
-    ID3D12Resource *GetNextDisplayOutputTexture(ID3D12Fence *fence, uint64 fenceValue, uint32 width, uint32 height) {
+    ID3D12Resource *GetNextDisplayOutputTexture(ID3D12Fence *fence, uint64 fenceValue, uint32 width, uint32 height,
+                                                uint32 scale) {
         const size_t nextIndex = GetDisplayFrameIndexForCompute();
         DisplayFrameContext &frameCtx = displayFrames[nextIndex];
 
@@ -1623,6 +1628,7 @@ struct Direct3D12GraphicsContext::Impl {
         frameCtx.computeFenceValue.store(fenceValue, std::memory_order_release);
         frameCtx.width = width;
         frameCtx.height = height;
+        frameCtx.scale = scale;
         return texture->resource.GetPointer();
     }
 
@@ -1791,6 +1797,7 @@ struct Direct3D12GraphicsContext::Impl {
             .id = frameCtx.textureID,
             .width = frameCtx.width,
             .height = frameCtx.height,
+            .scale = frameCtx.scale,
         };
     }
 
@@ -2055,8 +2062,8 @@ ID3D12Device *Direct3D12GraphicsContext::GetDevice() const {
 }
 
 ID3D12Resource *Direct3D12GraphicsContext::GetNextDisplayOutputTexture(ID3D12Fence *fence, uint64 fenceValue,
-                                                                       uint32 width, uint32 height) {
-    return m_impl->GetNextDisplayOutputTexture(fence, fenceValue, width, height);
+                                                                       uint32 width, uint32 height, uint32 scale) {
+    return m_impl->GetNextDisplayOutputTexture(fence, fenceValue, width, height, scale);
 }
 
 } // namespace app::gfx

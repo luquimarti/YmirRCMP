@@ -1141,6 +1141,8 @@ void Settings::ResetToDefaults() {
     video.swRenderer.threadedDeinterlacer = true;
     video.enhancements.deinterlace = false;
     video.enhancements.transparentMeshes = false;
+    video.enhancements.internalResolution = 1;
+    video.enhancements.dynamicResolution = false;
 
     audio.volume = 0.8;
     audio.mute = false;
@@ -1662,6 +1664,12 @@ SettingsLoadResult Settings::Load(const std::filesystem::path &path) {
             if (auto tblEnhancements = tblVideo["Enhancements"]) {
                 Parse(tblEnhancements, "Deinterlace", video.enhancements.deinterlace);
                 Parse(tblEnhancements, "TransparentMeshes", video.enhancements.transparentMeshes);
+                if (auto value = tblEnhancements["DynamicResolution"].value<bool>()) {
+                    video.enhancements.dynamicResolution = *value;
+                }
+                if (auto value = tblEnhancements["InternalResolution"].value<int64_t>()) {
+                    video.enhancements.internalResolution = static_cast<uint32>(std::clamp<int64_t>(*value, 1, 4));
+                }
             }
         } else {
             Parse(tblVideo, "Deinterlace", video.enhancements.deinterlace);
@@ -2076,6 +2084,8 @@ SettingsSaveResult Settings::Save() {
             {"Enhancements", toml::table{{
                 {"Deinterlace", video.enhancements.deinterlace.Get()},
                 {"TransparentMeshes", video.enhancements.transparentMeshes.Get()},
+                {"InternalResolution", static_cast<int64_t>(video.enhancements.internalResolution)},
+                {"DynamicResolution", video.enhancements.dynamicResolution},
             }}},
         }}},
 

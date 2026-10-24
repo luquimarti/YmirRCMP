@@ -46,9 +46,13 @@ static const bool deinterlace = BitTest(g_commonParams.enhancements, 0);
 static const uint colorRAMMode = BitExtract(g_commonParams.displayParams, 6, 2);
 static const uint kCRAMAddressMask = colorRAMMode == 1 ? 0x7FF : 0x3FF;
 
-static const uint kSpriteFBBaseOffset = spriteDisplayFB * kVDP1FBRAMSize;
-static const uint kDeinterlaceFBBaseOffset = kVDP1FBRAMSize * 2;
-static const uint kVDP1MeshFBOffset = kVDP1FBRAMSize * 2 * 2;
+// Internal resolution scale: the VDP1 framebuffers and the layer outputs are kScale times larger on each axis
+static const uint kScale = BitExtract(g_commonParams.enhancements, 2, 3) + 1u;
+static const uint kVDP1FBSizeS = kVDP1FBRAMSize * kScale * kScale;
+
+static const uint kSpriteFBBaseOffset = spriteDisplayFB * kVDP1FBSizeS;
+static const uint kDeinterlaceFBBaseOffset = kVDP1FBSizeS * 2;
+static const uint kVDP1MeshFBOffset = kVDP1FBSizeS * 2 * 2;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Utilities
@@ -429,7 +433,7 @@ struct SpriteOutput {
 
 // index 0 = sprite
 // index 1 = transparent meshes
-SpriteOutput DrawSprite(uint2 pos, uint2 outPos, uint index) {
+SpriteOutput DrawSprite(uint2 pos, uint2 outPos, uint index, uint2 sub) {
     const bool meshLayer = index == 1;
 
     SpriteOutput output = { kTransparentPixel, 0, false, false, false };
@@ -455,7 +459,9 @@ SpriteOutput DrawSprite(uint2 pos, uint2 outPos, uint index) {
             spritePos.y >>= 1;
         }
     }
-    const uint fbAddr = spritePos.x + spritePos.y * fbSize.x;
+    // Pixel within the scaled framebuffer
+    const uint2 spritePosS = spritePos * kScale + sub;
+    const uint fbAddr = spritePosS.x + spritePosS.y * (fbSize.x * kScale);
 
     if (InsideWindows(outPos)) {
         return output;
@@ -527,11 +533,15 @@ SpriteOutput DrawSprite(uint2 pos, uint2 outPos, uint index) {
 // TODO: 32 threads might be suboptimal on AMD GPUs
 [numthreads(32, 1, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
-    const uint2 drawCoord = uint2(id.x, id.y + g_commonParams.startY);
+    // Threads cover the scaled output; per-line and per-dot parameters use the unscaled coordinates
+    const uint2 drawCoordS = uint2(id.x, id.y + g_commonParams.startY * kScale);
+    const uint2 sub = drawCoordS % kScale;
+    const uint2 drawCoord = drawCoordS / kScale;
     const uint2 outCoord = uint2(drawCoord.x, GetY(drawCoord.y));
-    const SpriteOutput output = DrawSprite(drawCoord, outCoord.xy, id.z);
-    g_layerOut[uint3(outCoord.xy, id.z + 6)] = output.layer;
-    g_spriteAttrsOut[uint3(outCoord.xy, id.z)] =
+    const uint2 outCoordS = outCoord * kScale + sub;
+    const SpriteOutput output = DrawSprite(drawCoord, outCoord.xy, id.z, sub);
+    g_layerOut[uint3(outCoordS, id.z + 6)] = output.layer;
+    g_spriteAttrsOut[uint3(outCoordS, id.z)] =
         output.colorCalcRatio |
         ((output.colorMSB ? 1u : 0u) << kSpriteAttrBitColorMSB) |
         ((output.shadowOrWindow ? 1u : 0u) << kSpriteAttrBitShadowWindow) |

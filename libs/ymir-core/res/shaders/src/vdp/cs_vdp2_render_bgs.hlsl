@@ -43,6 +43,10 @@ static const bool coeffDataPerDot = BitTest(g_commonParams.rotParams, 5);
 
 static const bool deinterlace = BitTest(g_commonParams.enhancements, 0);
 
+// Internal resolution scale: layer outputs and sprite attributes are kScale times larger on each axis.
+// Backgrounds are rendered at the native resolution and written as kScale x kScale blocks.
+static const uint kScale = BitExtract(g_commonParams.enhancements, 2, 3) + 1u;
+
 static const uint colorRAMMode = BitExtract(g_commonParams.displayParams, 6, 2);
 static const uint kCRAMAddressMask = colorRAMMode == 1 ? 0x7FF : 0x3FF;
 
@@ -140,7 +144,7 @@ bool InsideWindow(GlobalWindowParams window, bool invert, uint2 pos) {
 }
 
 bool InsideSpriteWindow(bool invert, uint2 pos) {
-    return BitTest(g_spriteAttrsIn[uint3(pos, 0)], kSpriteAttrBitShadowWindow) != invert;
+    return BitTest(g_spriteAttrsIn[uint3(pos * kScale, 0)], kSpriteAttrBitShadowWindow) != invert;
 }
 
 bool InsideWindows(LayerWindowParams layerWindows, uint2 pos) {
@@ -1144,14 +1148,22 @@ bool InsideColorCalcWindow(uint2 pos) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Entrypoint
 
+void WriteLayer(uint3 outCoord, uint4 value) {
+    for (uint j = 0; j < kScale; ++j) {
+        for (uint i = 0; i < kScale; ++i) {
+            g_layerOut[uint3(outCoord.x * kScale + i, outCoord.y * kScale + j, outCoord.z)] = value;
+        }
+    }
+}
+
 [numthreads(32, 1, 7)]
 void CSMain(uint3 id : SV_DispatchThreadID) {
     const uint2 drawCoord = uint2(id.x, id.y + g_commonParams.startY);
     const uint3 outCoord = uint3(drawCoord.x, GetY(drawCoord.y, false), id.z);
     if (id.z <= 3) {
-        g_layerOut[outCoord] = DrawNBG(drawCoord, id.z);
+        WriteLayer(outCoord, DrawNBG(drawCoord, id.z));
     } else if (id.z <= 5) {
-        g_layerOut[outCoord] = DrawRBG(drawCoord, id.z - 4);
+        WriteLayer(outCoord, DrawRBG(drawCoord, id.z - 4));
     } else if (id.z == 6) {
         g_colorCalcWindowOut[outCoord.xy] = InsideColorCalcWindow(drawCoord) ? 1u : 0u;
     }

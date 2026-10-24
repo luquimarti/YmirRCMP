@@ -91,6 +91,7 @@ static_assert(sizeof(HLSLint3) == sizeof(HLSLint) * 3);
 struct EnhancementsParams {
     HLSLuint deinterlace : 1;       //     0  Deinterlace
     HLSLuint transparentMeshes : 1; //     1  Render mesh sprites as transparent
+    HLSLuint internalScaleM1 : 3;   //   2-4  Internal resolution scale minus 1 (0=1x .. 3=4x)
 };
 static_assert(sizeof(EnhancementsParams) == sizeof(HLSLuint));
 

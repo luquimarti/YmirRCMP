@@ -11,8 +11,26 @@
 #include <ymir/core/types.hpp>
 
 #include <array>
+#include <atomic>
 
 namespace ymir::vdp::config {
+
+/// @brief Internal resolution scale of the hardware renderers (1 to 4).
+/// Read when a hardware renderer is created; changing it requires recreating the renderer.
+inline std::atomic<uint32> hwInternalScale{1};
+
+/// @brief Internal resolution scale requested at runtime (dynamic resolution), 0 = use the maximum.
+/// Applied by the hardware renderer at the start of the next frame, clamped to `hwInternalScale`.
+inline std::atomic<uint32> hwRequestedScale{0};
+
+/// @brief Internal resolution scale currently used by the hardware renderer (for display only).
+inline std::atomic<uint32> hwCurrentScale{1};
+
+/// @brief Returns the internal resolution scale clamped to the supported range.
+inline uint32 GetHWInternalScale() {
+    const uint32 scale = hwInternalScale.load(std::memory_order_relaxed);
+    return scale < 1 ? 1 : scale > 4 ? 4 : scale;
+}
 
 /// @brief Graphics enhancements configuration.
 struct Enhancements {

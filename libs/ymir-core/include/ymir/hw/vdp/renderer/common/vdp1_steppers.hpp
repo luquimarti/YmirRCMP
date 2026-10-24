@@ -494,8 +494,8 @@ struct Edge {
         auto [x1, y1] = coord1;
         auto [x2, y2] = coord2;
 
-        const sint32 dx = bit::sign_extend<13>(x2 - x1);
-        const sint32 dy = bit::sign_extend<13>(y2 - y1);
+        const sint32 dx = bit::sign_extend<t_bits>(x2 - x1);
+        const sint32 dy = bit::sign_extend<t_bits>(y2 - y1);
         const uint32 adx = abs(dx);
         const uint32 ady = abs(dy);
         m_dmaj = std::max(adx, ady);
@@ -634,12 +634,12 @@ FORCE_INLINE CoordS32 VectorFromPoints(CoordS32 pointA, CoordS32 pointB) {
 template <sint32 t_bits = 13>
 struct QuadStepper {
     FORCE_INLINE QuadStepper(CoordS32 coordA, CoordS32 coordB, CoordS32 coordC, CoordS32 coordD) {
-        const uint32 deltaLx = abs(bit::sign_extend<13>(coordD.x() - coordA.x()));
-        const uint32 deltaLy = abs(bit::sign_extend<13>(coordD.y() - coordA.y()));
-        const uint32 deltaRx = abs(bit::sign_extend<13>(coordC.x() - coordB.x()));
-        const uint32 deltaRy = abs(bit::sign_extend<13>(coordC.y() - coordB.y()));
+        const uint32 deltaLx = abs(bit::sign_extend<t_bits>(coordD.x() - coordA.x()));
+        const uint32 deltaLy = abs(bit::sign_extend<t_bits>(coordD.y() - coordA.y()));
+        const uint32 deltaRx = abs(bit::sign_extend<t_bits>(coordC.x() - coordB.x()));
+        const uint32 deltaRy = abs(bit::sign_extend<t_bits>(coordC.y() - coordB.y()));
 
-        m_dmaj = std::max(std::max(deltaLx, deltaLy), std::max(deltaRx, deltaRy)) & 0xFFF;
+        m_dmaj = std::max(std::max(deltaLx, deltaLy), std::max(deltaRx, deltaRy)) & ((1u << (t_bits - 1)) - 1u);
         m_step = 0;
 
         m_edgeL.Setup(coordA, coordD, m_dmaj);

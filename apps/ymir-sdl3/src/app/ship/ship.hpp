@@ -26,6 +26,8 @@ namespace ymir_recomp {
 class Runtime;
 } // namespace ymir_recomp
 
+struct SDL_Window;
+
 namespace app {
 
 class SharedContext;
@@ -62,6 +64,9 @@ void Start();
 
 /// Window title, e.g. "TheBortas - PDZ II".
 std::string WindowTitle();
+
+/// Sets the window icon from <exe dir>/ship/icon.png, if present.
+void ApplyWindowIcon(SDL_Window *window);
 
 /// Whether Ymir's own menu bar may be shown (only with "Advanced" on).
 bool ShowYmirMenus();

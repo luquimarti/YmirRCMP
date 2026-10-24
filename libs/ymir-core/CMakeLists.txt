@@ -411,6 +411,8 @@ set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 set(COMPUTE_SHADER_SOURCES
     res/shaders/src/vdp/cs_vdp1_erase.hlsl
     res/shaders/src/vdp/cs_vdp1_fbram_write.hlsl
+    res/shaders/src/vdp/cs_vdp1_fbram_downsample.hlsl
+    res/shaders/src/vdp/cs_vdp1_fbram_upsample.hlsl
 
     res/shaders/src/vdp/cs_vdp2_compose.hlsl
     res/shaders/src/vdp/cs_vdp2_render_bgs.hlsl
